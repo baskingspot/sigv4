@@ -12,9 +12,10 @@
     inputs@{ flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       # imports and inputsFrom below mirror each other, including the
-      # toolchain version: pick that once, in the import.
+      # toolchain version: 0.17, the one the repo builds with.
       imports = with inputs.baskingspot.flakeModules; [
         base
+        docs
         zig."0.17"
       ];
 
@@ -24,11 +25,10 @@
           devShells.default = pkgs.mkShell {
             inputsFrom = [
               config.devShells.base
+              config.devShells.docs
               config.devShells."zig-0-17"
             ];
-
-            # Project-specific tools.
-            packages = with pkgs; [ ];
+            packages = [ config.packages."ziglint-0-17" ];
           };
         };
     };

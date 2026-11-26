@@ -68,4 +68,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_example_tests = b.addRunArtifact(example_tests);
     test_step.dependOn(&run_example_tests.step);
+
+    // The guide's examples: the code docs/content shows, compiled against the
+    // public module so a guide page cannot show code that does not build.
+    const guide_mod = b.createModule(.{
+        .root_source_file = b.path("docs/examples/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "sigv4", .module = mod }},
+    });
+    const guide_tests = b.addTest(.{
+        .root_module = guide_mod,
+        .test_runner = test_runner,
+    });
+    const run_guide_tests = b.addRunArtifact(guide_tests);
+    test_step.dependOn(&run_guide_tests.step);
 }

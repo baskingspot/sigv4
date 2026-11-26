@@ -1,0 +1,24 @@
+# The sigv4 guide, served at baskingspot.dev/sigv4/. The theme and the site
+# build come from baskingspot-docs; the router in baskingspot/site serves
+# /sigv4/...
+base_url = "https://baskingspot.dev/sigv4"
+theme = "baskingspot"
+title = "sigv4"
+description = "AWS Signature Version 4 request signing in Zig: the canonical request, the string to sign, and the HMAC-SHA256 signing key, with no I/O."
+
+generate_feeds = false
+build_search_index = false
+
+[markdown]
+insert_anchor_links = "heading"
+
+[markdown.highlighting]
+# An unknown fence language is a build error, not an unhighlighted block.
+error_on_missing_language = true
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+[extra]
+repo = "baskingspot/sigv4"
+api = true
+third_party = true
