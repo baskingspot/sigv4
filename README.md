@@ -15,42 +15,87 @@ is no allocator, no clock, no credentials store, and no HTTP client: the
 timestamp is a string you supply, and every output goes into a buffer you own.
 
 ```zig
-var headers = [_]sigv4.canonical.Header{
-    .{ .name = "host", .value = "example.amazonaws.com" },
-    .{ .name = "x-amz-date", .value = "20260826T000000Z" },
-};
-var field: [512]u8 = undefined;
-var creq: [2048]u8 = undefined;
+const sigv4 = @import("sigv4");
 
-const value = try sigv4.signing.writeAuthorization(&field, &creq, .{
-    .method = "GET",
-    .path = "/",
-    .headers = &headers,
-    .payload_hash = sigv4.empty_payload_hash,
-}, .{
-    .access_key = "AKIDEXAMPLE",
-    .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-    .region = "us-east-1",
-    .service = "s3",
-    .timestamp = "20260826T000000Z",
-});
+/// Writes the Authorization field value for a signed GET.
+fn authorize(
+    field: []u8,
+    creq: []u8,
+    headers: []sigv4.canonical.Header,
+) sigv4.signing.SignError![]const u8 {
+    return sigv4.signing.writeAuthorization(field, creq, .{
+        .method = "GET",
+        .path = "/",
+        .headers = headers,
+        .payload_hash = sigv4.empty_payload_hash,
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .timestamp = "20260826T000000Z",
+    });
+}
 ```
 
-The project is incubating. The API will move, so pin a commit.
+`test/examples.zig` holds that function and asserts the field value botocore
+computes for it. The project is incubating: the API will move, so pin a commit.
 
-## What is in it
+## API
 
-- [The canonical request](docs/content/_index.md#the-canonical-request): `canonical.writeRequest` writes the method, the URI, the query, the headers, the signed names, and the payload hash into one buffer, sorting the header and query slices in place.
-- [The key chain](docs/content/_index.md#the-key-chain): `signing.signingKey` runs `kDate` to `kRegion` to `kService` to `kSigning` from `AWS4` and the secret, and `signing.Scope` takes its date from the timestamp so the two cannot disagree.
-- [Signing a request](docs/content/_index.md#signing-a-request): `signing.writeStringToSign` and `signing.signature` are the two stages below `signing.writeAuthorization`, which writes the field value and signs an `x-amz-security-token` that the header array has no slot for.
+Two namespaces, `canonical` and `signing`. A function writes into a buffer the
+caller owns, returns a slice of it, and returns `error.NoSpaceLeft` if the
+buffer was too small. Nothing allocates.
 
-Not implemented:
+### canonical
 
-- Presigned URLs: `writeQuery` sorts and encodes the parameters you give it, and nothing adds `X-Amz-Signature`.
-- Streaming signatures: `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and the chunk signatures below it are absent.
-- Retries: no clock, no skew correction, no backoff. `Scope.init` rejects a timestamp that is not `YYYYMMDDTHHMMSSZ` and stops there.
+`canonical.Request` is the request in the terms the signature is defined over.
+
+- `method` and `path` are the request target. `path` takes the decoded path, and the canonical URI is encoded from those bytes: every byte outside the unreserved set becomes uppercase `%XX`, and `/` stays literal. An escaped path is escaped again, `%25` to `%2525`.
+- `query` is the pairs. Each name and value is percent-decoded and re-encoded, and the pairs sort by encoded name and then encoded value.
+- `headers` holds the headers to sign and nothing else. Names sort case-folded, duplicates join in arrival order, values are trimmed, and runs of spaces and tabs collapse to one space. A header the request sends but does not sign stays out of the slice. `host` and `x-amz-date` must be in it.
+- `payload_hash` is the lowercase hex SHA-256 of the body, or `UNSIGNED-PAYLOAD`. `sigv4.empty_payload_hash` is the hash of an empty body.
+- `normalize_path` removes `.`, `..`, and empty path segments. Every service but S3 signs the normalized path, so S3 sets it false.
+
+`canonical.writeRequest(out, request)` writes the six newline-separated parts
+and sorts `headers` and `query` in place. `writeRequestWith(out, request, extra)`
+adds one header that is not in the slice.
+
+The parts are public on their own: `writeUri(out, path, normalize)`,
+`writeQuery(out, params)`, `writeHeaders(out, headers, extra)`,
+`writeNames(out, headers, extra)`, and `contains(headers, name)`.
+
+### signing
+
+`signing.Credentials` holds `access_key`, `secret_key`, `region`, `service`,
+`timestamp`, and an optional `session_token`. The timestamp is
+`YYYYMMDDTHHMMSSZ`; nothing reads a clock.
+
+`signing.Scope` is `date/region/service/aws4_request`. `Scope.init` copies the
+date out of the timestamp so the two cannot disagree, and returns
+`error.InvalidTimestamp` unless the timestamp is sixteen bytes in the basic
+form.
+
+- `signing.writeScope(out, scope)` writes the credential scope.
+- `signing.writeStringToSign(out, timestamp, scope, canonical_request_hash)` writes the string to sign from the 32-byte hash.
+- `signing.signingKey(secret_key, scope)` runs the four HMACs, `kDate`, `kRegion`, `kService`, and `kSigning`. A secret longer than one SHA-256 block is hashed first, as HMAC does.
+- `signing.signature(key, string_to_sign)` is the MAC over the string to sign.
+
+`signing.writeAuthorization(out, creq, request, credentials)` writes the field
+value. `creq` is scratch for the canonical request and holds no result. With
+`session_token` set, the token joins the signed headers as
+`x-amz-security-token`, and the request still has to send that header. A
+request that lists the header and also carries the token returns
+`error.DuplicateSessionToken`.
+
+## Limits
+
+- Presigning: `X-Amz-Signature` in a query string is not built here. `canonical.writeQuery` sorts and encodes the parameters you give it.
+- Streaming signatures: nothing writes `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` or the chunk signatures below it. A body with a streaming hash arrives as a string in `Request.payload_hash`.
+- SigV4a: `sigv4.algorithm` is `AWS4-HMAC-SHA256`, and the chain for `AWS4-ECDSA-P256-SHA256` is not here.
+- Retries and skew: no clock, no `Date` header, no backoff. `Scope.init` checks the shape of the timestamp and nothing else.
 - Credentials: no profile, no STS call, no refresh. `signing.Credentials` holds strings.
-- SigV4a: one algorithm, `AWS4-HMAC-SHA256`.
+- HTTP: no client, no request type, no header parsing. `Request` is four slices, a hash, and a flag; nothing parses a message.
 
 ## Install
 
@@ -70,7 +115,6 @@ builds with Zig 0.17.
 
 ## Documentation
 
-- The [guide](docs/content/_index.md) shows each stage with the code, and says which function to reach for.
 - [`CHANGELOG.md`](CHANGELOG.md) records what moved in the API.
 - [`THIRD_PARTY.md`](THIRD_PARTY.md) records where the vendored fixtures came from and their license.
 - [`AGENTS.md`](AGENTS.md) has the working notes for the repository.
@@ -82,21 +126,20 @@ just ci
 ```
 
 `nix develop` provides the toolchain. `just` lists the recipes. `just test`
-runs the unit tests, the AWS signing test suite in `tests/`, and the guide's
-examples. `just lint` runs ziglint, `zig fmt --check`, and the rest of the
-house checks.
+runs the unit tests, the AWS signing test suite and the reference vectors under
+`test/fixtures/`, and `test/examples.zig`.
 
-The official suite is vendored at the commit recorded in
-[`THIRD_PARTY.md`](THIRD_PARTY.md), and the reference vectors in
-`tests/vectors/` were signed with botocore. Every case in both roots runs:
-`just test` fails on the first canonical request, string to sign, signature, or
-`Authorization` field that does not match.
+The suite is vendored unmodified at the commit recorded in
+[`THIRD_PARTY.md`](THIRD_PARTY.md), and the reference vectors were signed with
+botocore. Every case in both roots runs: `just test` fails on the first
+canonical request, string to sign, signature, or `Authorization` field that
+does not match.
 
 ## License
 
 MIT. See [`LICENSE`](LICENSE). The AWS signing test suite in
-`tests/aws-signing-test-suite/` is Apache-2.0, and its `LICENSE` and `NOTICE`
-travel with it. See [`THIRD_PARTY.md`](THIRD_PARTY.md).
+`test/fixtures/aws-signing-suite/` is Apache-2.0, and its `LICENSE` and
+`NOTICE` travel with it. See [`THIRD_PARTY.md`](THIRD_PARTY.md).
 
 ## How it's made
 

@@ -37,11 +37,11 @@ pub fn build(b: *std.Build) void {
     run_suite_tests.has_side_effects = true;
     test_step.dependOn(&run_suite_tests.step);
 
-    // The guide's examples are real programs against the public module,
-    // tested with everything else so a guide page cannot show code that does
-    // not build.
+    // The README's example and the public-surface checks are compiled against
+    // the module with everything else, so the README cannot show code that
+    // does not build.
     const examples_mod = b.createModule(.{
-        .root_source_file = b.path("docs/examples/root.zig"),
+        .root_source_file = b.path("test/examples.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "sigv4", .module = mod }},

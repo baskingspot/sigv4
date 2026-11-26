@@ -1,23 +1,23 @@
-//! The guide's examples, compiled and run with the module's own test suite.
-//! A guide page cannot show code that does not build.
+//! The README's example and the public surface, compiled against the module
+//! with the rest of the tests. The README cannot show code that does not
+//! build.
 
 const std = @import("std");
 const testing = std.testing;
 
 const sigv4 = @import("sigv4");
 
-test "sign a request" {
-    var headers = [_]sigv4.canonical.Header{
-        .{ .name = "host", .value = "example.amazonaws.com" },
-        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
-    };
-    var field: [512]u8 = undefined;
-    var creq: [2048]u8 = undefined;
-
-    const value = try sigv4.signing.writeAuthorization(&field, &creq, .{
+/// Writes the Authorization field value for a signed GET. This is the README's
+/// example.
+fn authorize(
+    field: []u8,
+    creq: []u8,
+    headers: []sigv4.canonical.Header,
+) sigv4.signing.SignError![]const u8 {
+    return sigv4.signing.writeAuthorization(field, creq, .{
         .method = "GET",
         .path = "/",
-        .headers = &headers,
+        .headers = headers,
         .payload_hash = sigv4.empty_payload_hash,
     }, .{
         .access_key = "AKIDEXAMPLE",
@@ -26,7 +26,17 @@ test "sign a request" {
         .service = "s3",
         .timestamp = "20260826T000000Z",
     });
+}
 
+test "the README example" {
+    var headers = [_]sigv4.canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
+    };
+    var field: [512]u8 = undefined;
+    var creq: [2048]u8 = undefined;
+
+    const value = try authorize(&field, &creq, &headers);
     try testing.expectEqualStrings(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260826/us-east-1/s3/aws4_request," ++
             " SignedHeaders=host;x-amz-date," ++
