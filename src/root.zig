@@ -1,18 +1,24 @@
-//! By convention, root.zig is the root source file when making a package.
-const std = @import("std");
-const Io = std.Io;
+//! AWS Signature Version 4 request signing in Zig: the canonical request, the
+//! string to sign, and the HMAC-SHA256 signing key, with no I/O.
+//!
+//! `canonical` builds the text the signature is defined over, from a request
+//! whose headers and query the caller already holds. `signing` derives the key
+//! chain, the signature, and the `Authorization` field value. Both write into
+//! caller-owned buffers, take no allocator, and read no clock: the timestamp
+//! arrives as a string.
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.writeAll("Run `zig build test` to run the tests.\n");
-}
+pub const canonical = @import("canonical.zig");
+pub const signing = @import("signing.zig");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+/// The algorithm both signed artefacts name. SigV4a is another algorithm.
+pub const algorithm = signing.algorithm;
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+/// The lowercase hex SHA-256 of an empty body. Every request with no body
+/// signs this string as its payload hash.
+pub const empty_payload_hash = canonical.empty_payload_hash;
+
+test {
+    _ = @import("encode.zig");
+    _ = canonical;
+    _ = signing;
 }
