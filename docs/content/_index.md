@@ -235,6 +235,16 @@ Presigning puts the signature in the query string, so a URL can be handed to a
 process that holds no credentials. `signing.presign` writes the final query,
 including `X-Amz-Signature`, into a buffer you own.
 
+```zig
+const query = try sigv4.signing.presign(&buffer, .{
+    .method = "GET",
+    .path = "/",
+    .path_mode = .s3,
+    .headers = &headers, // host alone
+    .payload_hash = "UNSIGNED-PAYLOAD",
+}, credentials, .{ .expires_seconds = 3600 });
+```
+
 The caller's own query parameters stay in the canonical query. Six parameters
 join them: `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`,
 `X-Amz-Expires`, `X-Amz-SignedHeaders`, and `X-Amz-Security-Token` when a
@@ -242,13 +252,22 @@ token is present. The canonical query sorts all of them; the emitted query
 uses the order above and appends `X-Amz-Signature` last.
 
 Only `host` is signed unless the caller adds more headers to the request, so
-the canonical header block is smaller than a header-auth request's. S3
-presigning uses `UNSIGNED-PAYLOAD`; pass it as `payload_hash`, because that is
-the caller's choice, not a rule the library can make for it.
+the canonical header block is smaller than a header-auth request's. A header
+the recipient must send can be added; a signed header it leaves out fails the
+signature.
 
-`expires_seconds` must be between 1 and 604800. AWS caps the value and rejects
-a URL that outlives its credential, and the rejection arrives in another
-process, later, which is why the open-ended form is not offered.
+S3 presigning requires `UNSIGNED-PAYLOAD`: S3 canonicalizes that line for every
+presigned request, so an S3 service with any other hash returns
+`error.ContentSha256Mismatch`, and a path mode other than `.s3` returns
+`error.PathModeMismatch`. A caller parameter whose name starts with `X-Amz-`
+returns `error.ReservedQueryParameter`, because the presigned form owns those
+names.
+
+`expires_seconds` must be between 1 and 604800 (`error.InvalidExpires`). AWS
+caps the value and rejects a URL that outlives its credential, and the rejection
+arrives in another process, later, which is why the open-ended form is not
+offered. `out` holds the escaped canonical URI while the signature is computed,
+so size it for the path and the query; `error.OutTooSmall` covers both.
 
 # Limits
 

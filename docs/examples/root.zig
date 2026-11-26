@@ -147,3 +147,34 @@ test "a request the signature cannot cover is refused" {
         }),
     );
 }
+
+test "write the query string of a presigned URL" {
+    var headers = [_]sigv4.canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var buffer: [1024]u8 = undefined;
+
+    const query = try sigv4.signing.presign(&buffer, .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = sigv4.empty_payload_hash,
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "service",
+        .timestamp = "20150830T123600Z",
+    }, .{ .expires_seconds = 3600 });
+
+    // The AWS signing suite's get-vanilla query fixture, byte for byte.
+    try testing.expectEqualStrings(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256" ++
+            "&X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fservice%2Faws4_request" ++
+            "&X-Amz-Date=20150830T123600Z" ++
+            "&X-Amz-SignedHeaders=host" ++
+            "&X-Amz-Expires=3600" ++
+            "&X-Amz-Signature=e93c787ed7f371d5c6b165c1b38ede9550f4dce4144713e844b25b7192d3865d",
+        query,
+    );
+}

@@ -7,6 +7,7 @@
 //! form `20150830T123600Z`.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const mem = std.mem;
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
@@ -482,7 +483,7 @@ const Merge = struct {
         }
         const field = canonical_fields[self.field_index];
         const order = encode.order(fieldName(field), self.params[self.param_index].name);
-        std.debug.assert(order != .eq);
+        assert(order != .eq);
         if (order == .lt) {
             defer self.field_index += 1;
             return .{ .field = field };
