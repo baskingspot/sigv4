@@ -12,50 +12,74 @@ const encode = @import("encode.zig");
 
 const Writer = std.Io.Writer;
 
+const whitespace = " \t\n\r\x0b\x0c";
+
 /// A canonical buffer that was too small. Nothing partial is returned.
 pub const WriteError = error{NoSpaceLeft};
+
+/// What a canonical request refuses besides a short buffer: a header set with
+/// no `host`, or a payload hash that is not a hash.
+pub const RequestError = error{
+    NoSpaceLeft,
+    MissingHost,
+    InvalidPayloadHash,
+};
 
 /// The lowercase hex SHA-256 of an empty body. Every request with no body
 /// signs this string as its payload hash.
 pub const empty_payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// How the canonical URI treats the wire path.
+pub const PathMode = enum {
+    /// Every service except S3. Normalizes dot segments, then encodes the wire
+    /// path again, so a wire `%25` becomes `%2525`.
+    service,
+    /// A service path with no normalization. Encodes the wire path again and
+    /// leaves dot segments alone. The AWS signing test suite signs both forms.
+    unnormalized,
+    /// S3. The wire path is the canonical URI, with no normalization and no
+    /// second encoding. The caller sends an encoded path.
+    s3,
+};
+
 /// One header field line. `name` is matched and written in ASCII case-folded
-/// form; `value` is trimmed and its runs of spaces and tabs collapse to one
-/// space. The caller de-folds continuation lines before it gets here.
+/// form; `value` has every run of ASCII whitespace collapsed to one space and
+/// its ends trimmed. The caller de-folds continuation lines before it gets
+/// here.
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
 };
 
-/// One query parameter as it appears on the wire. A valid %XX triplet is
-/// decoded and re-encoded, so a name may be percent-encoded or not.
+/// One query parameter as it goes on the wire. A valid %XX triplet passes
+/// through unchanged, every other byte outside the unreserved set is escaped,
+/// and a literal `%` must arrive as `%25`.
 pub const Param = struct {
     name: []const u8,
     value: []const u8,
 };
 
 /// A request in the terms the signature is defined over. The headers a caller
-/// sends but does not sign stay out of `headers`; `host` and `x-amz-date` must
-/// be in it.
+/// sends but does not sign stay out of `headers`. `host` must be in it.
 pub const Request = struct {
     method: []const u8,
-    /// The path from the request target, decoded. The canonical URI is encoded
-    /// from these bytes. An empty path signs as `/`.
+    /// The path from the request target, as it goes on the wire. An empty
+    /// path signs as `/`.
     path: []const u8,
     /// Sorted in place.
     query: []Param = &.{},
     /// Sorted in place.
     headers: []Header,
-    /// Lowercase hex SHA-256 of the body, or `UNSIGNED-PAYLOAD`.
+    /// Lowercase hex SHA-256 of the body, `UNSIGNED-PAYLOAD`, or a
+    /// `STREAMING-` form.
     payload_hash: []const u8,
-    /// Removes `.`, `..`, and empty path segments, the way RFC 3986 section
-    /// 5.2.4 does. Every service except S3 signs the normalized path.
-    normalize_path: bool = false,
+    path_mode: PathMode = .service,
 };
 
 /// Writes the whole canonical request, sorting `request.headers` and
-/// `request.query` in place.
-pub fn writeRequest(out: []u8, request: Request) WriteError![]const u8 {
+/// `request.query` in place. `host` must be among the headers, and
+/// `payload_hash` must be a hash, `UNSIGNED-PAYLOAD`, or a `STREAMING-` form.
+pub fn writeRequest(out: []u8, request: Request) RequestError![]const u8 {
     return writeRequestWith(out, request, null);
 }
 
@@ -65,25 +89,26 @@ pub fn writeRequest(out: []u8, request: Request) WriteError![]const u8 {
 ///
 /// `extra` must not share a name with a header in the list; two fields of the
 /// same name would be written as one line with the values comma-joined.
-pub fn writeRequestWith(out: []u8, request: Request, extra: ?Header) WriteError![]const u8 {
+pub fn writeRequestWith(out: []u8, request: Request, extra: ?Header) RequestError![]const u8 {
+    try validate(request, extra);
     var w: Writer = .fixed(out);
     writeRequestTo(&w, request, extra) catch return error.NoSpaceLeft;
     return w.buffered();
 }
 
-/// Writes the canonical URI for a decoded path.
+/// Writes the canonical URI for a wire path.
 ///
-/// The bytes are escaped as given, so an already-escaped target is escaped
-/// again: `%25` becomes `%2525`. Pass the decoded path, which is what S3
-/// object keys and every other service's path have in common.
-pub fn writeUri(out: []u8, path: []const u8, normalize: bool) WriteError![]const u8 {
+/// In `.service` mode the path is normalized and encoded again, so an escape
+/// that the wire already has becomes a second escape. In `.s3` mode the bytes
+/// are the canonical URI, so the caller sends an encoded path.
+pub fn writeUri(out: []u8, path: []const u8, mode: PathMode) WriteError![]const u8 {
     var w: Writer = .fixed(out);
-    writePathTo(&w, path, normalize) catch return error.NoSpaceLeft;
+    writePathTo(&w, path, mode) catch return error.NoSpaceLeft;
     return w.buffered();
 }
 
-/// Writes the canonical query string, sorting `params` in place by encoded
-/// name and then by encoded value.
+/// Writes the canonical query string, sorting `params` in place by canonical
+/// name and then canonical value.
 pub fn writeQuery(out: []u8, params: []Param) WriteError![]const u8 {
     std.mem.sort(Param, params, {}, paramLessThan);
     var w: Writer = .fixed(out);
@@ -113,15 +138,22 @@ pub fn writeNames(out: []u8, headers: []Header, extra: ?Header) WriteError![]con
 /// True when `name` is in `headers`, ASCII case-folded. One scan, no order
 /// required.
 pub fn contains(headers: []const Header, name: []const u8) bool {
+    return find(headers, name) != null;
+}
+
+/// The value of the first header named `name`, ASCII case-folded, or null.
+pub fn find(headers: []const Header, name: []const u8) ?[]const u8 {
     for (headers) |header| {
-        if (nameOrder(header.name, name) == .eq) return true;
+        if (nameOrder(header.name, name) == .eq) return header.value;
     }
-    return false;
+    return null;
 }
 
 /// The streaming form of `writeNames`, for a caller that already owns a writer.
-/// `headers` must be sorted.
+/// `headers` and `extra` must be sorted; the assertion is here because a
+/// wrong order writes a SignedHeaders value that does not verify.
 pub fn writeNamesInto(w: *Writer, headers: []const Header, extra: ?Header) Writer.Error!void {
+    std.debug.assert(isSorted(headers, extra));
     var it: Sorted = .init(headers, extra);
     var previous: ?[]const u8 = null;
     var first = true;
@@ -136,12 +168,35 @@ pub fn writeNamesInto(w: *Writer, headers: []const Header, extra: ?Header) Write
     }
 }
 
+fn validate(request: Request, extra: ?Header) RequestError!void {
+    if (!hasHost(request.headers, extra)) return error.MissingHost;
+    if (!validPayloadHash(request.payload_hash)) return error.InvalidPayloadHash;
+}
+
+fn hasHost(headers: []const Header, extra: ?Header) bool {
+    if (contains(headers, "host")) return true;
+    const header = extra orelse return false;
+    return nameOrder(header.name, "host") == .eq;
+}
+
+fn validPayloadHash(hash: []const u8) bool {
+    if (std.mem.eql(u8, hash, "UNSIGNED-PAYLOAD")) return true;
+    if (std.mem.startsWith(u8, hash, "STREAMING-")) return true;
+    if (hash.len != 64) return false;
+    for (hash) |byte| {
+        if (std.ascii.isDigit(byte)) continue;
+        if (byte >= 'a' and byte <= 'f') continue;
+        return false;
+    }
+    return true;
+}
+
 fn writeRequestTo(w: *Writer, request: Request, extra: ?Header) Writer.Error!void {
     std.mem.sort(Header, request.headers, {}, headerLessThan);
     std.mem.sort(Param, request.query, {}, paramLessThan);
-    try w.writeAll(request.method);
+    try writeUpper(w, request.method);
     try w.writeByte('\n');
-    try writePathTo(w, request.path, request.normalize_path);
+    try writePathTo(w, request.path, request.path_mode);
     try w.writeByte('\n');
     try writeQueryTo(w, request.query);
     try w.writeByte('\n');
@@ -152,16 +207,16 @@ fn writeRequestTo(w: *Writer, request: Request, extra: ?Header) Writer.Error!voi
     try w.writeAll(request.payload_hash);
 }
 
-fn writePathTo(w: *Writer, path: []const u8, normalize: bool) Writer.Error!void {
+fn writePathTo(w: *Writer, path: []const u8, mode: PathMode) Writer.Error!void {
     if (path.len == 0) {
         try w.writeByte('/');
         return;
     }
-    if (!normalize) {
-        try encode.writePath(w, path);
-        return;
+    switch (mode) {
+        .service => try writeNormalizedPath(w, path),
+        .unnormalized => try encode.writePath(w, path),
+        .s3 => try w.writeAll(path),
     }
-    try writeNormalizedPath(w, path);
 }
 
 fn writeNormalizedPath(w: *Writer, path: []const u8) Writer.Error!void {
@@ -225,11 +280,14 @@ fn writeHeadersTo(w: *Writer, headers: []const Header, extra: ?Header) Writer.Er
     }
 }
 
+/// Collapses every run of ASCII whitespace to one space and trims both ends,
+/// which is `' '.join(value.split())` and also keeps a value with a CR or LF
+/// from writing a second canonical line.
 fn writeValue(w: *Writer, value: []const u8) Writer.Error!void {
-    const trimmed = std.mem.trim(u8, value, " \t");
+    const trimmed = std.mem.trim(u8, value, whitespace);
     var pending_space = false;
     for (trimmed) |byte| {
-        if (byte == ' ' or byte == '\t') {
+        if (std.ascii.isWhitespace(byte)) {
             pending_space = true;
             continue;
         }
@@ -241,6 +299,10 @@ fn writeValue(w: *Writer, value: []const u8) Writer.Error!void {
 
 fn writeLower(w: *Writer, bytes: []const u8) Writer.Error!void {
     for (bytes) |byte| try w.writeByte(std.ascii.toLower(byte));
+}
+
+fn writeUpper(w: *Writer, bytes: []const u8) Writer.Error!void {
+    for (bytes) |byte| try w.writeByte(std.ascii.toUpper(byte));
 }
 
 fn headerLessThan(_: void, a: Header, b: Header) bool {
@@ -269,6 +331,18 @@ fn nameOrder(a: []const u8, b: []const u8) std.math.Order {
     if (a.len < b.len) return .lt;
     if (a.len > b.len) return .gt;
     return .eq;
+}
+
+fn isSorted(headers: []const Header, extra: ?Header) bool {
+    var it: Sorted = .init(headers, extra);
+    var previous: ?[]const u8 = null;
+    while (it.next()) |header| {
+        if (previous) |name| {
+            if (nameOrder(name, header.name) == .gt) return false;
+        }
+        previous = header.name;
+    }
+    return true;
 }
 
 /// The header list as the signature sees it: the caller's headers in sorted
@@ -304,29 +378,109 @@ const Sorted = struct {
 
 test "an empty path signs as one slash" {
     var buffer: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("/", try writeUri(&buffer, "", false));
+    try std.testing.expectEqualStrings("/", try writeUri(&buffer, "", .service));
+    try std.testing.expectEqualStrings("/", try writeUri(&buffer, "", .s3));
 }
 
-test "normalization drops dot and empty segments" {
-    const cases = [_]struct { path: []const u8, normalized: []const u8 }{
-        .{ .path = "/", .normalized = "/" },
-        .{ .path = "//", .normalized = "/" },
-        .{ .path = "//example//", .normalized = "/example/" },
-        .{ .path = "/./example", .normalized = "/example" },
-        .{ .path = "/example/..", .normalized = "/" },
-        .{ .path = "/example1/example2/../..", .normalized = "/" },
-        .{ .path = "/example space/", .normalized = "/example%20space/" },
+test "a service path is normalized and encoded again" {
+    const cases = [_]struct { path: []const u8, canonical: []const u8 }{
+        .{ .path = "/", .canonical = "/" },
+        .{ .path = "//", .canonical = "/" },
+        .{ .path = "//example//", .canonical = "/example/" },
+        .{ .path = "/./example", .canonical = "/example" },
+        .{ .path = "/example/..", .canonical = "/" },
+        .{ .path = "/example1/example2/../..", .canonical = "/" },
+        .{ .path = "/example space/", .canonical = "/example%20space/" },
+        .{ .path = "/a/b/", .canonical = "/a/b/" },
+        .{ .path = "/a%25b", .canonical = "/a%2525b" },
     };
     for (cases) |case| {
         var buffer: [64]u8 = undefined;
-        try std.testing.expectEqualStrings(case.normalized, try writeUri(&buffer, case.path, true));
+        try std.testing.expectEqualStrings(case.canonical, try writeUri(&buffer, case.path, .service));
     }
 }
 
-test "a path is encoded from the bytes it has" {
-    var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("/a%2525b", try writeUri(&buffer, "/a%25b", false));
-    try std.testing.expectEqualStrings("/a%2525b", try writeUri(&buffer, "/a%25b", true));
+test "an unnormalized service path keeps its dot segments" {
+    const cases = [_]struct { path: []const u8, canonical: []const u8 }{
+        .{ .path = "//example//", .canonical = "//example//" },
+        .{ .path = "/example/..", .canonical = "/example/.." },
+        .{ .path = "/a b", .canonical = "/a%20b" },
+        .{ .path = "/a%25b", .canonical = "/a%2525b" },
+    };
+    for (cases) |case| {
+        var buffer: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(case.canonical, try writeUri(&buffer, case.path, .unnormalized));
+    }
+}
+
+test "an S3 path is the wire path" {
+    const cases = [_][]const u8{ "/", "/a/b/", "/a%20b", "/a%2Bb", "/a%25b", "/a%3Db", "/a b" };
+    for (cases) |path| {
+        var buffer: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(path, try writeUri(&buffer, path, .s3));
+    }
+}
+
+test "the method is upper case" {
+    var headers = [_]Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var buffer: [256]u8 = undefined;
+    const canonical = try writeRequest(&buffer, .{
+        .method = "get",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = empty_payload_hash,
+    });
+    try std.testing.expect(std.mem.startsWith(u8, canonical, "GET\n"));
+}
+
+test "a request without host is refused" {
+    var headers = [_]Header{
+        .{ .name = "x-amz-date", .value = "20150830T123600Z" },
+    };
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectError(error.MissingHost, writeRequest(&buffer, .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = empty_payload_hash,
+    }));
+}
+
+test "a payload hash that is not a hash is refused" {
+    var headers = [_]Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var buffer: [256]u8 = undefined;
+    const request: Request = .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = empty_payload_hash,
+    };
+    var upper: [64]u8 = undefined;
+    @memcpy(&upper, empty_payload_hash);
+    for (&upper) |*byte| byte.* = std.ascii.toUpper(byte.*);
+
+    try std.testing.expectError(error.InvalidPayloadHash, writeRequest(&buffer, .{
+        .method = request.method,
+        .path = request.path,
+        .headers = request.headers,
+        .payload_hash = &upper,
+    }));
+    try std.testing.expectError(error.InvalidPayloadHash, writeRequest(&buffer, .{
+        .method = request.method,
+        .path = request.path,
+        .headers = request.headers,
+        .payload_hash = "deadbeef",
+    }));
+    var unsigned = request;
+    unsigned.payload_hash = "UNSIGNED-PAYLOAD";
+    _ = try writeRequest(&buffer, unsigned);
+    var streaming = request;
+    streaming.payload_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+    _ = try writeRequest(&buffer, streaming);
 }
 
 test "headers sort case-folded and duplicates join in arrival order" {
@@ -334,15 +488,15 @@ test "headers sort case-folded and duplicates join in arrival order" {
         .{ .name = "X-Dupe", .value = "b" },
         .{ .name = "Host", .value = " example.amazonaws.com " },
         .{ .name = "x-dupe", .value = "a" },
-        .{ .name = "X-Tab", .value = "a\t \tb" },
+        .{ .name = "X-Gap", .value = "a\t \nb" },
     };
     var buffer: [256]u8 = undefined;
     var names: [64]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "host:example.amazonaws.com\nx-dupe:b,a\nx-tab:a b\n",
+        "host:example.amazonaws.com\nx-dupe:b,a\nx-gap:a b\n",
         try writeHeaders(&buffer, &headers, null),
     );
-    try std.testing.expectEqualStrings("host;x-dupe;x-tab", try writeNames(&names, &headers, null));
+    try std.testing.expectEqualStrings("host;x-dupe;x-gap", try writeNames(&names, &headers, null));
 }
 
 test "an extra header joins at its sorted place" {
@@ -363,7 +517,7 @@ test "an extra header joins at its sorted place" {
     );
 }
 
-test "query parameters sort by encoded name and then encoded value" {
+test "query parameters sort by canonical name and then canonical value" {
     var params = [_]Param{
         .{ .name = "a", .value = "2" },
         .{ .name = " ", .value = "first" },
@@ -375,4 +529,13 @@ test "query parameters sort by encoded name and then encoded value" {
         "=&%20=first&a=1&a=2",
         try writeQuery(&buffer, &params),
     );
+}
+
+test "a bare query key gets an empty value" {
+    var params = [_]Param{
+        .{ .name = "flag", .value = "" },
+        .{ .name = "a", .value = "1" },
+    };
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("a=1&flag=", try writeQuery(&buffer, &params));
 }

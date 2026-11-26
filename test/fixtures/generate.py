@@ -23,7 +23,7 @@ import os
 import sys
 
 import botocore
-from botocore.auth import SigV4Auth
+from botocore.auth import S3SigV4Auth, SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
@@ -36,13 +36,18 @@ TOKEN = "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"
 OUT_ROOT = os.path.join(os.path.dirname(__file__), "vectors", "v4")
 
 
-def sign(case, method, path, params, headers, region="us-east-1", service="service", token=None):
+def sign(case, method, path, params, headers, region="us-east-1", service="service", token=None, s3=False):
     """Sign one request with botocore and write the suite's files.
 
     `headers` are the (name, value) pairs the caller sends, in order, and a
     repeated name is a second line. botocore adds X-Amz-Date, the session token
     when it is passed as a credential, and the Authorization field; the files
     record the request as sent and the three stages of the signature.
+
+    `path` is the wire path. The S3 signer adds X-Amz-Content-SHA256 and leaves
+    the path alone; the generic signer normalizes and escapes it again. The
+    context records which signer ran, so the Zig runner uses the same path
+    mode.
     """
     url = f"https://{HOST}{path}"
     request = AWSRequest(
@@ -56,7 +61,8 @@ def sign(case, method, path, params, headers, region="us-east-1", service="servi
     request.context["timestamp"] = TIMESTAMP
     request.context["payload_signing_enabled"] = True
 
-    signer = SigV4Auth(Credentials(ACCESS_KEY, SECRET_KEY, token), service, region)
+    signer_type = S3SigV4Auth if s3 else SigV4Auth
+    signer = signer_type(Credentials(ACCESS_KEY, SECRET_KEY, token), service, region)
     signer._modify_request_before_signing(request)
     canonical_request = signer.canonical_request(request)
     string_to_sign = signer.string_to_sign(request, canonical_request)
@@ -95,6 +101,8 @@ def sign(case, method, path, params, headers, region="us-east-1", service="servi
     }
     if token is not None:
         context["credentials"]["token"] = TOKEN
+    if s3:
+        context["path_mode"] = "s3"
 
     write(directory, "request.txt", request_text)
     write(directory, "context.json", json.dumps(context, indent=4) + "\n")
@@ -143,9 +151,16 @@ def main():
         [("Host", HOST)],
     )
 
-    # A literal percent in the object key, escaped once on the wire and once
-    # again in the canonical URI.
-    sign("double-encoded-path", "GET", "/a%25b", None, [("Host", HOST)], service="s3")
+    # A key with no `=` at all.
+    sign("bare-query-key", "GET", "/?flag", None, [("Host", HOST)])
+
+    # A literal percent in the path, escaped once on the wire and once again
+    # by the service path mode.
+    sign("service-double-encoded-path", "GET", "/a%25b", None, [("Host", HOST)])
+
+    # An S3 key with a space, a plus, a percent, and an equals sign. The wire
+    # path is the canonical URI, and S3 also requires x-amz-content-sha256.
+    sign("s3-key-escapes", "GET", "/a%20b%2Bc%25d%3De", None, [("Host", HOST)], service="s3", s3=True)
 
     # A token from STS: botocore adds the header and signs it, and the caller
     # never holds a second copy of it.

@@ -1,6 +1,6 @@
 //! The percent-encoding rules the canonical request stands on. A byte outside
-//! the unreserved set becomes %XX with uppercase hex digits, which is the one
-//! thing every AWS SDK agrees on.
+//! the unreserved set becomes %XX with uppercase hex digits. The canonical
+//! query keeps a %XX that the wire already has, because it takes wire text.
 
 const std = @import("std");
 
@@ -16,17 +16,17 @@ pub fn unreserved(byte: u8) bool {
     };
 }
 
-/// Writes one query name or value in canonical form: a valid %XX triplet is
-/// decoded first and then re-encoded, so the wire form and the decoded form
-/// land on the same bytes.
+/// Writes one query name or value in canonical form. The input is wire text:
+/// a valid %XX triplet passes through unchanged, every other byte outside the
+/// unreserved set becomes uppercase %XX, and a literal `%` must arrive as
+/// `%25`.
 pub fn writeQueryComponent(w: *Writer, bytes: []const u8) Writer.Error!void {
-    var encoded: Encoded = .init(bytes);
-    while (encoded.next()) |byte| try w.writeByte(byte);
+    var canonical: Canonical = .init(bytes);
+    while (canonical.next()) |byte| try w.writeByte(byte);
 }
 
-/// Writes a raw path with its `/` separators left literal. Every other byte
-/// outside the unreserved set is escaped, `%` included: a path that arrives
-/// percent-encoded comes out encoded twice, which is what the signature wants.
+/// Writes a path with its `/` separators left literal and every other byte
+/// outside the unreserved set escaped, with no dot-segment removal.
 pub fn writePath(w: *Writer, path: []const u8) Writer.Error!void {
     for (path) |byte| {
         if (byte == '/' or unreserved(byte)) {
@@ -37,7 +37,9 @@ pub fn writePath(w: *Writer, path: []const u8) Writer.Error!void {
     }
 }
 
-/// Writes one raw path segment, a path with no `/` in it.
+/// Writes one path segment with every byte outside the unreserved set escaped.
+/// This is the second escape a service path takes, so a wire `%25` becomes
+/// `%2525` here.
 pub fn writePathSegment(w: *Writer, segment: []const u8) Writer.Error!void {
     for (segment) |byte| {
         if (unreserved(byte)) {
@@ -53,58 +55,58 @@ fn writeEscape(w: *Writer, byte: u8) Writer.Error!void {
     try w.writeAll(&escape);
 }
 
-/// The canonical encoded form of `raw`, one byte at a time. A valid %XX
-/// triplet is decoded before it is re-encoded, so `a%20b`, `a b`, and
-/// `a%20%62` all yield the same stream. An invalid triplet is literal bytes.
-pub const Encoded = struct {
+/// The canonical form of a wire query component, one byte at a time. A valid
+/// %XX passes through as written. Any other byte outside the unreserved set
+/// becomes %XX. The stream is what the canonical query writes and what its
+/// sort compares, so the two cannot disagree.
+pub const Canonical = struct {
     raw: []const u8,
     index: usize = 0,
     pending: [3]u8 = undefined,
     pending_end: u8 = 0,
     pending_at: u8 = 0,
 
-    pub fn init(raw: []const u8) Encoded {
+    pub fn init(raw: []const u8) Canonical {
         return .{ .raw = raw };
     }
 
-    /// The next byte of the encoded form, or null at the end.
-    pub fn next(self: *Encoded) ?u8 {
+    /// The next byte of the canonical form, or null at the end.
+    pub fn next(self: *Canonical) ?u8 {
         if (self.pending_at < self.pending_end) {
             const byte = self.pending[self.pending_at];
             self.pending_at += 1;
             return byte;
         }
         if (self.index >= self.raw.len) return null;
-        const byte = self.take();
-        if (unreserved(byte)) return byte;
+        const byte = self.raw[self.index];
+        if (unreserved(byte)) {
+            self.index += 1;
+            return byte;
+        }
+        if (byte == '%' and self.index + 3 <= self.raw.len) {
+            const high = self.raw[self.index + 1];
+            const low = self.raw[self.index + 2];
+            if (std.ascii.isHex(high) and std.ascii.isHex(low)) {
+                self.pending = .{ '%', high, low };
+                self.index += 3;
+                self.pending_end = 3;
+                self.pending_at = 1;
+                return '%';
+            }
+        }
         self.pending = .{ '%', upper_hex[byte >> 4], upper_hex[byte & 0xf] };
+        self.index += 1;
         self.pending_end = 3;
         self.pending_at = 1;
         return '%';
     }
-
-    fn take(self: *Encoded) u8 {
-        if (self.index + 3 <= self.raw.len) {
-            if (self.raw[self.index] == '%') {
-                if (digit(self.raw[self.index + 1])) |high| {
-                    if (digit(self.raw[self.index + 2])) |low| {
-                        self.index += 3;
-                        return (high << 4) | low;
-                    }
-                }
-            }
-        }
-        const byte = self.raw[self.index];
-        self.index += 1;
-        return byte;
-    }
 };
 
-/// Compares the canonical encoded forms of `a` and `b`, which is the order the
+/// Compares the canonical forms of `a` and `b`, which is the order the
 /// canonical query string sorts in.
 pub fn order(a: []const u8, b: []const u8) std.math.Order {
-    var left: Encoded = .init(a);
-    var right: Encoded = .init(b);
+    var left: Canonical = .init(a);
+    var right: Canonical = .init(b);
     while (true) {
         const l = left.next();
         const r = right.next();
@@ -117,15 +119,6 @@ pub fn order(a: []const u8, b: []const u8) std.math.Order {
     }
 }
 
-fn digit(byte: u8) ?u8 {
-    return switch (byte) {
-        '0'...'9' => byte - '0',
-        'A'...'F' => byte - 'A' + 10,
-        'a'...'f' => byte - 'a' + 10,
-        else => null,
-    };
-}
-
 test "every unreserved byte stays literal" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
@@ -133,41 +126,53 @@ test "every unreserved byte stays literal" {
     try std.testing.expectEqualStrings("abcXYZ019-._~", w.buffered());
 }
 
-test "reserved bytes use uppercase hex" {
+test "a reserved byte uses uppercase hex" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
-    try writeQueryComponent(&w, "a b/c&d=e%f");
-    try std.testing.expectEqualStrings("a%20b%2Fc%26d%3De%25f", w.buffered());
+    try writeQueryComponent(&w, "a b&c=d");
+    try std.testing.expectEqualStrings("a%20b%26c%3Dd", w.buffered());
 }
 
-test "a path keeps its separators" {
+test "a written escape passes through unchanged" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
-    try writePath(&w, "/example space/");
-    try std.testing.expectEqualStrings("/example%20space/", w.buffered());
+    try writeQueryComponent(&w, "a%20b%e1%88%B4");
+    try std.testing.expectEqualStrings("a%20b%e1%88%B4", w.buffered());
 }
 
-test "a triplet is decoded before it is encoded" {
+test "a literal percent must arrive as an escape" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
-    try writeQueryComponent(&w, "%e1%88%B4");
-    try std.testing.expectEqualStrings("%E1%88%B4", w.buffered());
+    try writeQueryComponent(&w, "100%");
+    try std.testing.expectEqualStrings("100%25", w.buffered());
+
+    var other: [64]u8 = undefined;
+    var w2: Writer = .fixed(&other);
+    try writeQueryComponent(&w2, "a%zz");
+    try std.testing.expectEqualStrings("a%25zz", w2.buffered());
 }
 
-test "an encoded and a decoded byte compare equal" {
+test "a path segment escapes everything else, the escape included" {
+    var buffer: [64]u8 = undefined;
+    var w: Writer = .fixed(&buffer);
+    try writePathSegment(&w, "a%20b c");
+    try std.testing.expectEqualStrings("a%2520b%20c", w.buffered());
+}
+
+test "a decoded byte and its escape compare equal" {
     try std.testing.expectEqual(std.math.Order.eq, order("a b", "a%20b"));
     try std.testing.expectEqual(std.math.Order.lt, order("%20", "a"));
     try std.testing.expectEqual(std.math.Order.gt, order("a", "%20"));
 }
 
-test "order reads encoded bytes, not raw ones" {
+test "order reads canonical bytes, not raw ones" {
     // A raw '.' (0x2e) sorts before a raw '/' (0x2f), but '/' encodes to
     // '%2F', and '%' (0x25) sorts before '.'.
     try std.testing.expectEqual(std.math.Order.lt, order("/", "."));
     try std.testing.expectEqual(std.math.Order.gt, order(".", "/"));
 }
 
-test "an invalid triplet is literal" {
-    try std.testing.expectEqual(std.math.Order.eq, order("%zz", "%25zz"));
-    try std.testing.expectEqual(std.math.Order.eq, order("%2", "%252"));
+test "an escape is kept as written, case included" {
+    try std.testing.expectEqual(std.math.Order.eq, order("%2f", "%2f"));
+    try std.testing.expectEqual(std.math.Order.lt, order("%2F", "%2f"));
 }

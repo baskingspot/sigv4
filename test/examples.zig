@@ -7,17 +7,19 @@ const testing = std.testing;
 
 const sigv4 = @import("sigv4");
 
-/// Writes the Authorization field value for a signed GET. This is the README's
-/// example.
-fn authorize(
-    field: []u8,
-    creq: []u8,
-    headers: []sigv4.canonical.Header,
-) sigv4.signing.SignError![]const u8 {
+/// Writes the Authorization field value for a signed S3 GET. This is the
+/// README's example.
+fn authorize(field: []u8, creq: []u8) sigv4.signing.SignError![]const u8 {
+    var headers = [_]sigv4.canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-content-sha256", .value = sigv4.empty_payload_hash },
+        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
+    };
     return sigv4.signing.writeAuthorization(field, creq, .{
         .method = "GET",
         .path = "/",
-        .headers = headers,
+        .path_mode = .s3,
+        .headers = &headers,
         .payload_hash = sigv4.empty_payload_hash,
     }, .{
         .access_key = "AKIDEXAMPLE",
@@ -29,18 +31,14 @@ fn authorize(
 }
 
 test "the README example" {
-    var headers = [_]sigv4.canonical.Header{
-        .{ .name = "host", .value = "example.amazonaws.com" },
-        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
-    };
     var field: [512]u8 = undefined;
     var creq: [2048]u8 = undefined;
 
-    const value = try authorize(&field, &creq, &headers);
+    const value = try authorize(&field, &creq);
     try testing.expectEqualStrings(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260826/us-east-1/s3/aws4_request," ++
-            " SignedHeaders=host;x-amz-date," ++
-            " Signature=89d28d8013f53cb672ecb1a68b8eddd43ef86619e53a64a94dbd72012b17c17f",
+            " SignedHeaders=host;x-amz-content-sha256;x-amz-date," ++
+            " Signature=42e3431ea83ebfba8aa2488a2fa9a07afae23a0fc658721ef9b2f105a0e9ab34",
         value,
     );
 }
@@ -48,6 +46,7 @@ test "the README example" {
 test "build the four stages by hand" {
     var headers = [_]sigv4.canonical.Header{
         .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-content-sha256", .value = sigv4.empty_payload_hash },
         .{ .name = "x-amz-date", .value = "20260826T000000Z" },
     };
     var creq: [2048]u8 = undefined;
@@ -55,6 +54,7 @@ test "build the four stages by hand" {
     const canonical = try sigv4.canonical.writeRequest(&creq, .{
         .method = "GET",
         .path = "/",
+        .path_mode = .s3,
         .headers = &headers,
         .payload_hash = sigv4.empty_payload_hash,
     });
@@ -69,7 +69,10 @@ test "build the four stages by hand" {
     const secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
     const key = sigv4.signing.signingKey(secret_access_key, scope);
     const mac = sigv4.signing.signature(key, string_to_sign);
-    try testing.expectEqual(@as(usize, 64), std.fmt.bytesToHex(mac, .lower).len);
+    try testing.expectEqualStrings(
+        "42e3431ea83ebfba8aa2488a2fa9a07afae23a0fc658721ef9b2f105a0e9ab34",
+        &std.fmt.bytesToHex(mac, .lower),
+    );
 }
 
 test "a session token joins the signature" {
@@ -79,6 +82,7 @@ test "a session token joins the signature" {
 
     var headers = [_]sigv4.canonical.Header{
         .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-content-sha256", .value = sigv4.empty_payload_hash },
         .{ .name = "x-amz-date", .value = "20260826T000000Z" },
     };
     var field: [1024]u8 = undefined;
@@ -87,6 +91,7 @@ test "a session token joins the signature" {
     const value = try sigv4.signing.writeAuthorization(&field, &creq, .{
         .method = "GET",
         .path = "/",
+        .path_mode = .s3,
         .headers = &headers,
         .payload_hash = sigv4.empty_payload_hash,
     }, .{
@@ -98,7 +103,7 @@ test "a session token joins the signature" {
         .session_token = token,
     });
 
-    try testing.expect(std.mem.indexOf(u8, value, "x-amz-security-token") != null);
+    try testing.expect(std.mem.find(u8, value, "x-amz-security-token") != null);
 }
 
 test "a header you do not list is not signed" {
@@ -119,19 +124,41 @@ test "a header you do not list is not signed" {
         .payload_hash = sigv4.empty_payload_hash,
     });
 
-    try testing.expect(std.mem.indexOf(u8, canonical, "user-agent") == null);
+    try testing.expect(std.mem.find(u8, canonical, "user-agent") == null);
     try testing.expect(std.mem.startsWith(u8, canonical, "GET\n/\n\nhost:example.amazonaws.com"));
 }
 
-test "the query is sorted after it is encoded" {
+test "the query sorts by its canonical form" {
     var params = [_]sigv4.canonical.Param{
         .{ .name = "b", .value = "2" },
         .{ .name = "a b", .value = "" },
         .{ .name = "a", .value = "1" },
+        .{ .name = "already", .value = "a%2Fb" },
     };
     var buffer: [128]u8 = undefined;
     try testing.expectEqualStrings(
-        "a=1&a%20b=&b=2",
+        "a=1&a%20b=&already=a%2Fb&b=2",
         try sigv4.canonical.writeQuery(&buffer, &params),
     );
+}
+
+test "a timestamp that disagrees with x-amz-date is refused" {
+    var headers = [_]sigv4.canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20260826T000001Z" },
+    };
+    var field: [512]u8 = undefined;
+    var creq: [2048]u8 = undefined;
+    try testing.expectError(error.TimestampMismatch, sigv4.signing.writeAuthorization(&field, &creq, .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = sigv4.empty_payload_hash,
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .timestamp = "20260826T000000Z",
+    }));
 }

@@ -114,7 +114,7 @@ fn runVariant(
         .query = params,
         .headers = headers,
         .payload_hash = payload_hash,
-        .normalize_path = context.normalize,
+        .path_mode = context.path_mode,
     };
 
     // A token from the context is not a header line in the wire request; the
@@ -278,7 +278,7 @@ const Context = struct {
     service: []const u8,
     timestamp: []const u8,
     session_token: ?[]const u8,
-    normalize: bool,
+    path_mode: sigv4.canonical.PathMode,
     sign_body: bool,
 };
 
@@ -296,6 +296,14 @@ fn parseContext(arena: Allocator, text: []const u8) !Context {
         null
     else if (credentials.get("token")) |value| value.string else null;
 
+    const normalize = (root.get("normalize") orelse return error.MalformedContext).bool;
+    const path_mode = if (root.get("path_mode")) |value|
+        try parsePathMode(value.string)
+    else if (normalize)
+        sigv4.canonical.PathMode.service
+    else
+        sigv4.canonical.PathMode.unnormalized;
+
     return .{
         .access_key = (credentials.get("access_key_id") orelse return error.MalformedContext).string,
         .secret_key = (credentials.get("secret_access_key") orelse return error.MalformedContext).string,
@@ -303,9 +311,16 @@ fn parseContext(arena: Allocator, text: []const u8) !Context {
         .service = (root.get("service") orelse return error.MalformedContext).string,
         .timestamp = try basicTimestamp(arena, timestamp),
         .session_token = session_token,
-        .normalize = (root.get("normalize") orelse return error.MalformedContext).bool,
+        .path_mode = path_mode,
         .sign_body = (root.get("sign_body") orelse return error.MalformedContext).bool,
     };
+}
+
+fn parsePathMode(name: []const u8) !sigv4.canonical.PathMode {
+    if (std.mem.eql(u8, name, "service")) return .service;
+    if (std.mem.eql(u8, name, "unnormalized")) return .unnormalized;
+    if (std.mem.eql(u8, name, "s3")) return .s3;
+    return error.MalformedContext;
 }
 
 fn basicTimestamp(arena: Allocator, iso: []const u8) ![]const u8 {

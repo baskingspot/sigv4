@@ -21,6 +21,8 @@ pub const session_token_header = "x-amz-security-token";
 
 const scope_terminator = "aws4_request";
 
+const whitespace = " \t\n\r\x0b\x0c";
+
 /// Everything a signature needs that is not the request.
 pub const Credentials = struct {
     access_key: []const u8,
@@ -34,13 +36,18 @@ pub const Credentials = struct {
     session_token: ?[]const u8 = null,
 };
 
-/// What a signing call can refuse: a buffer that was too small, a timestamp
-/// that is not `YYYYMMDDTHHMMSSZ`, or a request that already lists the session
-/// token header while the credentials also carry a token.
+/// What a signing call can refuse: a buffer that was too small, a request
+/// without `host`, a payload hash that is not a hash, a timestamp that is not
+/// `YYYYMMDDTHHMMSSZ` or not the one in the request, or a session token that
+/// the header list already carries.
 pub const SignError = error{
-    NoSpaceLeft,
+    CreqTooSmall,
+    OutTooSmall,
+    MissingHost,
+    InvalidPayloadHash,
     InvalidTimestamp,
     DuplicateSessionToken,
+    TimestampMismatch,
 };
 
 /// The credential scope, `date/region/service/aws4_request`, with the date
@@ -87,19 +94,24 @@ pub fn writeStringToSign(
 /// string to sign.
 pub fn signingKey(secret_key: []const u8, scope: Scope) [32]u8 {
     var hmac = secretKeyHmac(secret_key);
+    defer zero(std.mem.asBytes(&hmac));
+
     var date_key: [32]u8 = undefined;
     hmac.update(&scope.date);
     hmac.final(&date_key);
+    defer zero(&date_key);
 
     hmac = HmacSha256.init(&date_key);
     var region_key: [32]u8 = undefined;
     hmac.update(scope.region);
     hmac.final(&region_key);
+    defer zero(&region_key);
 
     hmac = HmacSha256.init(&region_key);
     var service_key: [32]u8 = undefined;
     hmac.update(scope.service);
     hmac.final(&service_key);
+    defer zero(&service_key);
 
     hmac = HmacSha256.init(&service_key);
     var signing_key: [32]u8 = undefined;
@@ -119,6 +131,10 @@ pub fn signature(key: [32]u8, string_to_sign: []const u8) [32]u8 {
 /// `canonical.writeRequest` does. `creq` is scratch for the canonical request
 /// and holds no result the caller asked for; size it like the canonical
 /// request, a few KiB for a normal request.
+///
+/// The request must carry `host` and either an `x-amz-date` equal to
+/// `credentials.timestamp` or a `Date` header. A signature AWS will reject is
+/// not the caller's to make.
 pub fn writeAuthorization(
     out: []u8,
     creq: []u8,
@@ -133,8 +149,12 @@ pub fn writeAuthorization(
     if (extra != null and canonical.contains(request.headers, session_token_header)) {
         return error.DuplicateSessionToken;
     }
+    try checkTimestamp(request.headers, credentials.timestamp);
 
-    const canonical_request = try canonical.writeRequestWith(creq, request, extra);
+    const canonical_request = canonical.writeRequestWith(creq, request, extra) catch |err| switch (err) {
+        error.NoSpaceLeft => return error.CreqTooSmall,
+        else => |other| return other,
+    };
     var digest: [32]u8 = undefined;
     Sha256.hash(canonical_request, &digest, .{});
 
@@ -148,7 +168,7 @@ pub fn writeAuthorization(
     sink.hasher.final(&mac);
 
     var w: Writer = .fixed(out);
-    writeField(&w, request.headers, extra, credentials, scope, mac) catch return error.NoSpaceLeft;
+    writeField(&w, request.headers, extra, credentials, scope, mac) catch return error.OutTooSmall;
     return w.buffered();
 }
 
@@ -202,10 +222,12 @@ fn writeField(
 
 /// HMAC keyed with `AWS4` + secret. A secret that does not fit one hash block
 /// is hashed first, which is what HMAC does with a long key, so no secret has
-/// to be copied into a buffer with a size limit.
+/// to be copied into a buffer with a size limit. The key material is zeroed
+/// before the function returns, the way `signingKey` zeroes the intermediates.
 fn secretKeyHmac(secret_key: []const u8) HmacSha256 {
     if (secret_key.len + 4 <= Sha256.block_length) {
         var key: [Sha256.block_length]u8 = undefined;
+        defer zero(&key);
         @memcpy(key[0..4], "AWS4");
         @memcpy(key[4..][0..secret_key.len], secret_key);
         return HmacSha256.init(key[0 .. 4 + secret_key.len]);
@@ -214,8 +236,23 @@ fn secretKeyHmac(secret_key: []const u8) HmacSha256 {
     hasher.update("AWS4");
     hasher.update(secret_key);
     var digest: [32]u8 = undefined;
+    defer zero(&digest);
     hasher.final(&digest);
     return HmacSha256.init(&digest);
+}
+
+fn zero(bytes: []u8) void {
+    std.crypto.secureZero(u8, bytes);
+}
+
+fn checkTimestamp(headers: []const canonical.Header, timestamp: []const u8) SignError!void {
+    if (canonical.find(headers, "x-amz-date")) |value| {
+        const trimmed = std.mem.trim(u8, value, whitespace);
+        if (!std.mem.eql(u8, trimmed, timestamp)) return error.TimestampMismatch;
+        return;
+    }
+    if (canonical.contains(headers, "date")) return;
+    return error.TimestampMismatch;
 }
 
 fn validTimestamp(timestamp: []const u8) bool {
@@ -405,4 +442,73 @@ test "a buffer that is too small is refused" {
         .headers = &headers,
         .payload_hash = canonical.empty_payload_hash,
     }));
+}
+
+test "a Date header stands in for x-amz-date" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "date", .value = "Sun, 30 Aug 2015 12:36:00 GMT" },
+    };
+    var field: [512]u8 = undefined;
+    var creq: [1024]u8 = undefined;
+    const value = try writeAuthorization(&field, &creq, .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = canonical.empty_payload_hash,
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "service",
+        .timestamp = "20150830T123600Z",
+    });
+    try std.testing.expect(std.mem.find(u8, value, "SignedHeaders=date;host") != null);
+}
+
+test "a request with no date at all is refused" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var field: [512]u8 = undefined;
+    var creq: [1024]u8 = undefined;
+    try std.testing.expectError(error.TimestampMismatch, writeAuthorization(&field, &creq, .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = canonical.empty_payload_hash,
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "service",
+        .timestamp = "20150830T123600Z",
+    }));
+}
+
+test "a short buffer names which one is short" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20150830T123600Z" },
+    };
+    const request: canonical.Request = .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = canonical.empty_payload_hash,
+    };
+    const credentials: Credentials = .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "service",
+        .timestamp = "20150830T123600Z",
+    };
+    var field: [512]u8 = undefined;
+    var small: [8]u8 = undefined;
+    try std.testing.expectError(error.CreqTooSmall, writeAuthorization(&field, &small, request, credentials));
+
+    var tiny: [8]u8 = undefined;
+    var creq: [1024]u8 = undefined;
+    try std.testing.expectError(error.OutTooSmall, writeAuthorization(&tiny, &creq, request, credentials));
 }
