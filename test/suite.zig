@@ -196,7 +196,7 @@ fn runVariant(
         try testing.expectEqualStrings(expected_field, field);
     } else if (context.session_token == null and hasParam(signed.query, "X-Amz-Security-Token")) {
         try testing.expectEqual(Root.suite, root);
-        try testing.expect(std.mem.eql(u8, name, unsigned_token_case));
+        try testing.expect(mem.eql(u8, name, unsigned_token_case));
         counter.skipped += 1;
     } else {
         // The query, built from the wire request: the caller's parameters as
@@ -220,10 +220,10 @@ fn runVariant(
 }
 
 fn hasParam(query: []const u8, name: []const u8) bool {
-    var pairs = std.mem.splitScalar(u8, query, '&');
+    var pairs = mem.splitScalar(u8, query, '&');
     while (pairs.next()) |pair| {
-        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
-        if (std.mem.eql(u8, pair[0..equals], name)) return true;
+        const equals = mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        if (mem.eql(u8, pair[0..equals], name)) return true;
     }
     return false;
 }
