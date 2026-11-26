@@ -21,6 +21,16 @@ A repo that must also build on the previous release follows the dual-version pat
 - This repo's GitHub settings come from `baskingspot/.github`, with `just settings`. Do not change them by hand.
 - To graduate the project, follow the `baskingspot-new-repo` skill: logos, a real README, and the audit passing.
 
+## Verification
+
+`just test` runs the AWS signing test suite in
+`test/fixtures/aws-signing-suite/` and the botocore vectors in
+`test/fixtures/vectors/`. Both roots are indexed at run
+time, with the working directory at the build root, so a new case is a
+directory with the suite's file layout and no runner change. Do not edit a
+vendored fixture. Add a vector with `test/fixtures/generate.py` and record the
+signer's version.
+
 ## Changelog
 
 `CHANGELOG.md` is one file, Keep a Changelog format, newest first. Add a bullet

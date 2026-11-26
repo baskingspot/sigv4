@@ -14,7 +14,7 @@ test:
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src build.zig
+    zig fmt --check src test/suite.zig test/examples.zig build.zig build.zig.zon
     nix fmt -- --ci
     oxfmt --check README.md AGENTS.md .github
     actionlint
@@ -24,7 +24,7 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src build.zig
+    zig fmt src test/suite.zig test/examples.zig build.zig build.zig.zon
     nix fmt
     oxfmt README.md AGENTS.md .github
     just --fmt

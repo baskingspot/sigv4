@@ -1,0 +1,3 @@
+GET /?tilde=%7e&slash=%2f&alpha=%41&percent=%25 HTTP/1.1
+Host:example.amazonaws.com
+
