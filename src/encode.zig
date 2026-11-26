@@ -4,7 +4,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Writer = std.Io.Writer;
+const Io = std.Io;
+const Writer = Io.Writer;
 
 const upper_hex = "0123456789ABCDEF";
 
@@ -72,13 +73,19 @@ fn writeEscape(w: *Writer, byte: u8) Writer.Error!void {
 /// query writes and what its sort compares, so the two cannot disagree.
 pub const Canonical = struct {
     raw: []const u8,
-    index: usize = 0,
-    pending: [3]u8 = undefined,
-    pending_end: u8 = 0,
-    pending_at: u8 = 0,
+    index: usize,
+    pending: [3]u8,
+    pending_end: u8,
+    pending_at: u8,
 
     pub fn init(raw: []const u8) Canonical {
-        return .{ .raw = raw };
+        return .{
+            .raw = raw,
+            .index = 0,
+            .pending = undefined,
+            .pending_end = 0,
+            .pending_at = 0,
+        };
     }
 
     /// The next byte of the canonical form, or null at the end.

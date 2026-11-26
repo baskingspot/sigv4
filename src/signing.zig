@@ -11,7 +11,8 @@ const mem = std.mem;
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
-const Writer = std.Io.Writer;
+const Io = std.Io;
+const Writer = Io.Writer;
 const testing = std.testing;
 const ascii = std.ascii;
 

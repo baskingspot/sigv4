@@ -12,7 +12,8 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const ascii = std.ascii;
 const testing = std.testing;
-const Writer = std.Io.Writer;
+const Io = std.Io;
+const Writer = Io.Writer;
 
 const encode = @import("encode.zig");
 
@@ -66,6 +67,7 @@ pub const Param = struct {
 
 /// A request in the terms the signature is defined over. The headers a caller
 /// sends but does not sign stay out of `headers`. `host` must be in it.
+// ast-grep-ignore: public-struct-field-default -- options bag: a request sets only what it has
 pub const Request = struct {
     method: []const u8,
     /// The path from the request target, as it goes on the wire. An empty
