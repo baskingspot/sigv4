@@ -30,6 +30,11 @@ fmt:
     oxfmt README.md AGENTS.md CHANGELOG.md docs/content docs/config.toml .github .oxfmtrc.jsonc
     just --fmt
 
+[doc("Run benchmarks (ReleaseFast by default); args pass to the binary: just bench --benchtime=250ms --filter=Sigv4")]
+[group("bench")]
+bench *ARGS:
+    zig build bench -- {{ ARGS }}
+
 [doc("The gate: the unit tests, the suite, and the guide's examples")]
 [group("ci")]
 check: test

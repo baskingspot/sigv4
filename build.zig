@@ -83,4 +83,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_guide_tests = b.addRunArtifact(guide_tests);
     test_step.dependOn(&run_guide_tests.step);
+
+    // Benchmarks. testingx owns the runner; `just bench` drives this step.
+    if (b.lazyImport(@This(), "testingx")) |testingx| {
+        const testingx_dependency = testingx_dep orelse unreachable;
+        const run_bench = testingx.addBench(b, .{
+            .module = testingx_dependency.module("testingx"),
+            .root_source_file = b.path("src/bench.zig"),
+            .imports = &.{.{ .name = "sigv4", .module = mod }},
+            .target = target,
+        });
+        run_bench.addPassthruArgs();
+        const bench_step = b.step("bench", "Run sigv4 benchmarks");
+        bench_step.dependOn(&run_bench.step);
+    }
 }
