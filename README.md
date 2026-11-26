@@ -160,11 +160,11 @@ only when the recipient must send it, because a signed header the recipient
 leaves out fails the signature. `host` is required, and its absence returns
 `error.MissingHost`. The `X-Amz-SignedHeaders` value names the same set.
 
-The signature covers `request.payload_hash` as given. S3 answers only a
-presigned URL that carries `UNSIGNED-PAYLOAD`, so that is the caller's choice,
-not a check: the query form has no `x-amz-content-sha256` header, and none is
-written. An S3 service still has to use `PathMode.s3` and returns
-`error.PathModeMismatch` otherwise.
+The signature covers `request.payload_hash` as given. S3 presigning is the
+exception: S3 canonicalizes `UNSIGNED-PAYLOAD` for every presigned request, so
+an S3 service with any other hash returns `error.ContentSha256Mismatch`, and a
+path mode other than `.s3` returns `error.PathModeMismatch`. The query form
+carries no `x-amz-content-sha256` header, and none is written.
 
 A caller parameter whose name starts with `X-Amz-` returns
 `error.ReservedQueryParameter`, case-folded and after decoding, because the
@@ -183,7 +183,7 @@ covers both.
   `post-sts-header-after` records.
 - Streaming signatures: nothing writes `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` or the chunk signatures below it. A body with a streaming hash arrives as a string in `Request.payload_hash`.
 - SigV4a: `sigv4.algorithm` is `AWS4-HMAC-SHA256`, and the chain for `AWS4-ECDSA-P256-SHA256` is not here.
-- S3 headers: the library does not add `x-amz-content-sha256`. `writeAuthorization` refuses an S3 request that leaves it out or signs a different value; `presign` writes no such header at all.
+- S3 headers: the library does not add `x-amz-content-sha256`. `writeAuthorization` refuses an S3 request that leaves it out or signs a different value; `presign` writes no such header and refuses an S3 payload hash other than `UNSIGNED-PAYLOAD`.
 - Retries and skew: no clock and no backoff. `Scope.init` checks the shape of the timestamp, and `writeAuthorization` checks that `x-amz-date` equals it.
 - Credentials: no profile, no STS call, no refresh. `signing.Credentials` holds strings.
 - HTTP: no client, no request type, no header parsing. `Request` is four slices, a hash, and a path mode; nothing parses a message.

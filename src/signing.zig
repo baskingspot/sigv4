@@ -48,8 +48,9 @@ pub const Credentials = struct {
     service: []const u8,
     /// The request time, `YYYYMMDDTHHMMSSZ`. The date half is the scope date.
     timestamp: []const u8,
-    /// A token from STS, signed as `x-amz-security-token`. The caller still
-    /// sends the header; this only puts it in the signature.
+    /// A token from STS. Header auth signs it as `x-amz-security-token`, and
+    /// the caller still sends that header. `presign` writes it as
+    /// `X-Amz-Security-Token` in the query instead.
     session_token: ?[]const u8 = null,
 };
 
@@ -235,10 +236,10 @@ pub fn writeAuthorization(
 /// `request.query` and `request.headers` are sorted in place, because the
 /// canonical request sorts and the caller owns the buffers.
 ///
-/// The signature covers `request.payload_hash` as given. S3 answers only a
-/// presigned URL that carries `UNSIGNED-PAYLOAD`, so that is the caller's
-/// choice; the query form has no `x-amz-content-sha256` header, and this
-/// writes none.
+/// The signature covers `request.payload_hash` as given. S3 presigning requires
+/// `UNSIGNED-PAYLOAD`: S3 canonicalizes that line for every presigned request,
+/// and any other hash returns `error.ContentSha256Mismatch`. The query form has
+/// no `x-amz-content-sha256` header, and this writes none.
 pub fn presign(
     out: []u8,
     request: canonical.Request,
@@ -552,13 +553,17 @@ fn isReserved(name: []const u8) bool {
     return true;
 }
 
-/// S3 answers a presigned URL only when the canonical URI is the wire path,
-/// the same rule the header form has. The content hash half of the header
-/// guard does not apply here: a presigned query carries no
-/// `x-amz-content-sha256`, and `UNSIGNED-PAYLOAD` is the caller's choice.
+/// S3 answers a presigned URL only when the canonical URI is the wire path and
+/// the payload line is `UNSIGNED-PAYLOAD`. S3 canonicalizes `UNSIGNED-PAYLOAD`
+/// for every presigned request, so any other hash signs a URL it answers with
+/// `SignatureDoesNotMatch`. The query form carries no `x-amz-content-sha256`
+/// header, and none is written.
 fn checkPresignedS3(request: canonical.Request, credentials: Credentials) SignError!void {
     if (!mem.startsWith(u8, credentials.service, "s3")) return;
     if (request.path_mode != .s3) return error.PathModeMismatch;
+    if (!mem.eql(u8, request.payload_hash, "UNSIGNED-PAYLOAD")) {
+        return error.ContentSha256Mismatch;
+    }
 }
 
 /// HMAC keyed with `AWS4` + secret. A secret that does not fit one hash block
@@ -1157,13 +1162,19 @@ test "a presigned S3 URL uses the S3 path mode and the caller's payload hash" {
         .expires_seconds = 3600,
     }));
 
-    // `UNSIGNED-PAYLOAD` is the caller's choice, not a check: a hashed payload
-    // signs here, and the query form carries no `x-amz-content-sha256`.
+    // S3 presigning fixes the payload line: any hash but `UNSIGNED-PAYLOAD`
+    // signs a URL S3 answers with SignatureDoesNotMatch.
     request.path_mode = .s3;
-    _ = try presign(&out, request, s3, .{ .expires_seconds = 3600 });
-    request.payload_hash = canonical.empty_payload_hash;
     const query = try presign(&out, request, s3, .{ .expires_seconds = 3600 });
     try testing.expect(mem.find(u8, query, "x-amz-content-sha256") == null);
+    request.payload_hash = canonical.empty_payload_hash;
+    try testing.expectError(error.ContentSha256Mismatch, presign(&out, request, s3, .{
+        .expires_seconds = 3600,
+    }));
+    request.payload_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+    try testing.expectError(error.ContentSha256Mismatch, presign(&out, request, s3, .{
+        .expires_seconds = 3600,
+    }));
 }
 
 test "a header in the slice is signed in the query form" {
