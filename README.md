@@ -10,9 +10,10 @@ duplicates, a query string that sorts by its encoded form and not its text, a
 path escaped a second time, a scope date that has to agree with the timestamp.
 
 This package is that layer. `canonical` builds the text the signature covers
-and `signing` derives the key chain and writes the `Authorization` field. There
-is no allocator, no clock, no credentials store, and no HTTP client: the
-timestamp is a string you supply, and every output goes into a buffer you own.
+and `signing` derives the key chain, writes the `Authorization` field, and
+writes the query string of a presigned URL. There is no allocator, no clock, no
+credentials store, and no HTTP client: the timestamp is a string you supply, and
+every output goes into a buffer you own.
 
 ```zig
 const sigv4 = @import("sigv4");
@@ -68,8 +69,13 @@ adds one header that is not in the slice.
 
 The parts are public on their own: `writeUri(out, path, mode)`,
 `writeQuery(out, params)`, `writeHeaders(out, headers, extra)`,
-`writeNames(out, headers, extra)`, `find(headers, name)`, and
-`contains(headers, name)`.
+`writeNames(out, headers, extra)`, `find(headers, name)`,
+`contains(headers, name)`, and `validPayloadHash(hash)`. `sortQuery(params)`
+and `sortHeaders(headers)` sort in place in canonical order. `writeQueryPair(w,
+param)`, `writeMethodInto(w, method)`, `writeHeadersInto(w, headers, extra)`,
+`writeNamesInto(w, headers, extra)`, and `writeQueryNamesInto(w, headers,
+extra)` write one piece into a `std.Io.Writer` the caller already holds, which
+is what `signing.presign` does with a hasher.
 
 ### signing
 
@@ -107,12 +113,77 @@ that starts with `s3`, `writeAuthorization` refuses a request that leaves it
 out or signs another value with `error.ContentSha256Mismatch`, and refuses a
 path mode other than `.s3` with `error.PathModeMismatch`.
 
+### presigning
+
+`signing.presign(out, request, credentials, options)` writes the query string
+of a presigned URL: the caller's parameters in the order it holds them, then
+`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-SignedHeaders`,
+`X-Amz-Expires`, `X-Amz-Security-Token` when a token is present, and
+`X-Amz-Signature` last. The signature covers the same parameters sorted, with
+no signature, so a caller's parameters enter the canonical query encoded and
+the URL as the wire text they arrived as.
+
+```zig
+const sigv4 = @import("sigv4");
+
+/// Writes the query string of a presigned S3 GET.
+fn presign(query: []u8) sigv4.signing.SignError![]const u8 {
+    var headers = [_]sigv4.canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    return sigv4.signing.presign(query, .{
+        .method = "GET",
+        .path = "/",
+        .path_mode = .s3,
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .timestamp = "20260826T000000Z",
+    }, .{ .expires_seconds = 3600 });
+}
+```
+
+`test/examples.zig` holds that function and asserts the query botocore computes
+for it.
+
+`options.expires_seconds` is 1 to 604800; anything else returns
+`error.InvalidExpires`. The credential scope is the header form's,
+`date/region/service/aws4_request`, with the date taken from the timestamp.
+
+`request.headers` is the set of headers the signature covers, exactly as it is
+for the header form. Pass `host` alone for the ordinary URL, and add a header
+only when the recipient must send it, because a signed header the recipient
+leaves out fails the signature. `host` is required, and its absence returns
+`error.MissingHost`. The `X-Amz-SignedHeaders` value names the same set.
+
+The signature covers `request.payload_hash` as given. S3 answers only a
+presigned URL that carries `UNSIGNED-PAYLOAD`, so that is the caller's choice,
+not a check: the query form has no `x-amz-content-sha256` header, and none is
+written. An S3 service still has to use `PathMode.s3` and returns
+`error.PathModeMismatch` otherwise.
+
+A caller parameter whose name starts with `X-Amz-` returns
+`error.ReservedQueryParameter`, case-folded and after decoding, because the
+presigned form owns those names.
+
+`out` also holds the escaped canonical URI while the signature is computed: a
+`..` segment removes bytes an earlier segment wrote, so the URI cannot be
+streamed. Size `out` for the escaped path and the query; `error.OutTooSmall`
+covers both.
+
 ## Limits
 
-- Presigning: `X-Amz-Signature` in a query string is not built here. `canonical.writeQuery` sorts and encodes the parameters you give it.
+- Presigning: the headers in `Request.headers` are the ones signed, and `host`
+  is required. A session token is signed when the credentials carry one;
+  nothing writes a token into a URL unsigned, which is the shape the suite's
+  `post-sts-header-after` records.
 - Streaming signatures: nothing writes `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` or the chunk signatures below it. A body with a streaming hash arrives as a string in `Request.payload_hash`.
 - SigV4a: `sigv4.algorithm` is `AWS4-HMAC-SHA256`, and the chain for `AWS4-ECDSA-P256-SHA256` is not here.
-- S3 headers: the library does not add `x-amz-content-sha256`. `writeAuthorization` refuses an S3 request that leaves it out or signs a different value.
+- S3 headers: the library does not add `x-amz-content-sha256`. `writeAuthorization` refuses an S3 request that leaves it out or signs a different value; `presign` writes no such header at all.
 - Retries and skew: no clock and no backoff. `Scope.init` checks the shape of the timestamp, and `writeAuthorization` checks that `x-amz-date` equals it.
 - Credentials: no profile, no STS call, no refresh. `signing.Credentials` holds strings.
 - HTTP: no client, no request type, no header parsing. `Request` is four slices, a hash, and a path mode; nothing parses a message.
@@ -152,8 +223,8 @@ runs the unit tests, the AWS signing test suite and the reference vectors under
 The suite is vendored unmodified at the commit recorded in
 [`THIRD_PARTY.md`](THIRD_PARTY.md), and the reference vectors were signed with
 botocore. Every case in both roots runs: `just test` fails on the first
-canonical request, string to sign, signature, or `Authorization` field that
-does not match.
+canonical request, string to sign, signature, `Authorization` field, or
+presigned query that does not match.
 
 ## License
 

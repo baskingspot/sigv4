@@ -31,6 +31,11 @@ directory with the suite's file layout and no runner change. Do not edit a
 vendored fixture. Add a vector with `test/fixtures/generate.py` and record the
 signer's version.
 
+A `query-` variant also runs through `signing.presign`: the emitted query is
+compared byte for byte against the fixture's, so a change to the parameter
+order or the assembly trips here. A vector is compared as parameters, because
+botocore emits them in another order.
+
 ## Changelog
 
 `CHANGELOG.md` is one file, Keep a Changelog format, newest first. Add a bullet
