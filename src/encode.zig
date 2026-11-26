@@ -17,9 +17,9 @@ pub fn unreserved(byte: u8) bool {
 }
 
 /// Writes one query name or value in canonical form. The input is wire text:
-/// a valid %XX triplet passes through unchanged, every other byte outside the
-/// unreserved set becomes uppercase %XX, and a literal `%` must arrive as
-/// `%25`.
+/// a valid %XX triplet is decoded and re-encoded, so `%7e` becomes `~` and
+/// `%2f` becomes `%2F`. Every other byte outside the unreserved set becomes
+/// uppercase %XX, and a literal `%` must arrive as `%25`.
 pub fn writeQueryComponent(w: *Writer, bytes: []const u8) Writer.Error!void {
     var canonical: Canonical = .init(bytes);
     while (canonical.next()) |byte| try w.writeByte(byte);
@@ -56,9 +56,9 @@ fn writeEscape(w: *Writer, byte: u8) Writer.Error!void {
 }
 
 /// The canonical form of a wire query component, one byte at a time. A valid
-/// %XX passes through as written. Any other byte outside the unreserved set
-/// becomes %XX. The stream is what the canonical query writes and what its
-/// sort compares, so the two cannot disagree.
+/// %XX is decoded first, then the byte is re-encoded, so `%7e` and `~` reach
+/// the same byte and `%2f` and `%2F` do too. The stream is what the canonical
+/// query writes and what its sort compares, so the two cannot disagree.
 pub const Canonical = struct {
     raw: []const u8,
     index: usize = 0,
@@ -78,29 +78,40 @@ pub const Canonical = struct {
             return byte;
         }
         if (self.index >= self.raw.len) return null;
-        const byte = self.raw[self.index];
-        if (unreserved(byte)) {
-            self.index += 1;
-            return byte;
-        }
-        if (byte == '%' and self.index + 3 <= self.raw.len) {
-            const high = self.raw[self.index + 1];
-            const low = self.raw[self.index + 2];
-            if (std.ascii.isHex(high) and std.ascii.isHex(low)) {
-                self.pending = .{ '%', high, low };
-                self.index += 3;
-                self.pending_end = 3;
-                self.pending_at = 1;
-                return '%';
-            }
-        }
+        const byte = self.take();
+        if (unreserved(byte)) return byte;
         self.pending = .{ '%', upper_hex[byte >> 4], upper_hex[byte & 0xf] };
-        self.index += 1;
         self.pending_end = 3;
         self.pending_at = 1;
         return '%';
     }
+
+    /// The next raw byte, with a valid %XX decoded to the byte it names.
+    fn take(self: *Canonical) u8 {
+        if (self.index + 3 <= self.raw.len) {
+            if (self.raw[self.index] == '%') {
+                if (hexDigit(self.raw[self.index + 1])) |high| {
+                    if (hexDigit(self.raw[self.index + 2])) |low| {
+                        self.index += 3;
+                        return (high << 4) | low;
+                    }
+                }
+            }
+        }
+        const byte = self.raw[self.index];
+        self.index += 1;
+        return byte;
+    }
 };
+
+fn hexDigit(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'A'...'F' => byte - 'A' + 10,
+        'a'...'f' => byte - 'a' + 10,
+        else => null,
+    };
+}
 
 /// Compares the canonical forms of `a` and `b`, which is the order the
 /// canonical query string sorts in.
@@ -133,11 +144,16 @@ test "a reserved byte uses uppercase hex" {
     try std.testing.expectEqualStrings("a%20b%26c%3Dd", w.buffered());
 }
 
-test "a written escape passes through unchanged" {
+test "a written escape is decoded and re-encoded" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
     try writeQueryComponent(&w, "a%20b%e1%88%B4");
-    try std.testing.expectEqualStrings("a%20b%e1%88%B4", w.buffered());
+    try std.testing.expectEqualStrings("a%20b%E1%88%B4", w.buffered());
+
+    var other: [64]u8 = undefined;
+    var w2: Writer = .fixed(&other);
+    try writeQueryComponent(&w2, "%7e%2f%41%25");
+    try std.testing.expectEqualStrings("~%2FA%25", w2.buffered());
 }
 
 test "a literal percent must arrive as an escape" {
@@ -172,7 +188,9 @@ test "order reads canonical bytes, not raw ones" {
     try std.testing.expectEqual(std.math.Order.gt, order(".", "/"));
 }
 
-test "an escape is kept as written, case included" {
-    try std.testing.expectEqual(std.math.Order.eq, order("%2f", "%2f"));
-    try std.testing.expectEqual(std.math.Order.lt, order("%2F", "%2f"));
+test "an escape and the byte it names compare equal" {
+    try std.testing.expectEqual(std.math.Order.eq, order("%2f", "%2F"));
+    try std.testing.expectEqual(std.math.Order.eq, order("%7e", "~"));
+    try std.testing.expectEqual(std.math.Order.eq, order("%41", "A"));
+    try std.testing.expectEqual(std.math.Order.eq, order("%25", "%"));
 }

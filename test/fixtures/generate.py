@@ -36,7 +36,7 @@ TOKEN = "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"
 OUT_ROOT = os.path.join(os.path.dirname(__file__), "vectors", "v4")
 
 
-def sign(case, method, path, params, headers, region="us-east-1", service="service", token=None, s3=False):
+def sign(case, method, path, params, headers, region="us-east-1", service="service", token=None, s3=False, wire=None):
     """Sign one request with botocore and write the suite's files.
 
     `headers` are the (name, value) pairs the caller sends, in order, and a
@@ -73,6 +73,8 @@ def sign(case, method, path, params, headers, region="us-east-1", service="servi
     os.makedirs(directory, exist_ok=True)
 
     target = path if not params else f"{path}?{wire_query(params)}"
+    if wire is not None:
+        target = f"{path}?{wire}"
 
     request_lines = [f"{method} {target} HTTP/1.1"]
     request_lines.extend(f"{name}:{value}" for name, value in headers)
@@ -153,6 +155,17 @@ def main():
 
     # A key with no `=` at all.
     sign("bare-query-key", "GET", "/?flag", None, [("Host", HOST)])
+
+    # Wire escapes the canonical query decodes and re-encodes: %7e is ~, %2f
+    # is %2F, %41 is A, and %25 stays %25.
+    sign(
+        "query-wire-escapes",
+        "GET",
+        "/",
+        [("tilde", "~"), ("slash", "/"), ("alpha", "A"), ("percent", "%")],
+        [("Host", HOST)],
+        wire="tilde=%7e&slash=%2f&alpha=%41&percent=%25",
+    )
 
     # A literal percent in the path, escaped once on the wire and once again
     # by the service path mode.

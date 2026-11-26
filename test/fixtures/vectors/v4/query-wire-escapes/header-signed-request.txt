@@ -1,0 +1,4 @@
+GET /?tilde=%7e&slash=%2f&alpha=%41&percent=%25 HTTP/1.1
+Host:example.amazonaws.com
+X-Amz-Date:20150830T123600Z
+Authorization:AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=e02b26bc187375b0ccac9b4088c18c99b07989dc97021437ddb3b046b73bbe3f

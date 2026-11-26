@@ -51,9 +51,10 @@ pub const Header = struct {
     value: []const u8,
 };
 
-/// One query parameter as it goes on the wire. A valid %XX triplet passes
-/// through unchanged, every other byte outside the unreserved set is escaped,
-/// and a literal `%` must arrive as `%25`.
+/// One query parameter as it goes on the wire. A valid %XX triplet is decoded
+/// and re-encoded, so `%7e` becomes `~` and `%2f` becomes `%2F`. Every other
+/// byte outside the unreserved set is escaped, and a literal `%` must arrive
+/// as `%25`.
 pub const Param = struct {
     name: []const u8,
     value: []const u8,
@@ -281,8 +282,8 @@ fn writeHeadersTo(w: *Writer, headers: []const Header, extra: ?Header) Writer.Er
 }
 
 /// Collapses every run of ASCII whitespace to one space and trims both ends,
-/// which is `' '.join(value.split())` and also keeps a value with a CR or LF
-/// from writing a second canonical line.
+/// which is the whitespace set aws-c-auth collapses, and also keeps a value
+/// with a CR or LF from writing a second canonical line.
 fn writeValue(w: *Writer, value: []const u8) Writer.Error!void {
     const trimmed = std.mem.trim(u8, value, whitespace);
     var pending_space = false;

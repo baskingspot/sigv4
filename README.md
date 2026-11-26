@@ -58,7 +58,7 @@ too small. Nothing allocates.
 
 - `method` is written in upper case, which is the form botocore signs.
 - `path` is the path from the request target as it goes on the wire, and `path_mode` says how the canonical URI treats it. `.service` normalizes dot segments and escapes the wire path again, so a wire `%25` becomes `%2525`. `.unnormalized` escapes without the dot-segment pass. `.s3` takes the wire path as the canonical URI, with no normalization and no second escape. An empty path signs as `/`.
-- `query` is the pairs as they go on the wire. A valid `%XX` passes through unchanged, every other byte outside the unreserved set becomes uppercase `%XX`, and a literal `%` must arrive as `%25`. Pairs sort by canonical name and then canonical value, and a pair with no `=` writes as `key=`.
+- `query` is the pairs as they go on the wire. A valid `%XX` is decoded and re-encoded, so `%7e` becomes `~` and `%2f` becomes `%2F`. Every byte outside the unreserved set becomes uppercase `%XX`, and a literal `%` must arrive as `%25`. Pairs sort by canonical name and then canonical value, and a pair with no `=` writes as `key=`.
 - `headers` holds the headers to sign and nothing else. Names sort case-folded, duplicates join in arrival order, and every run of ASCII whitespace in a value collapses to one space. A header the request sends but does not sign stays out of the slice. `host` must be in it, or the call returns `error.MissingHost`.
 - `payload_hash` is 64 lowercase hex characters, `UNSIGNED-PAYLOAD`, or a `STREAMING-` form. Anything else returns `error.InvalidPayloadHash`, so uppercase hex and a raw digest do not sign in silence. `sigv4.empty_payload_hash` is the hash of an empty body.
 
@@ -102,18 +102,20 @@ request that lists the header and also carries the token returns
 `error.DuplicateSessionToken`.
 
 S3 also requires `x-amz-content-sha256` on every header-signed request. The
-caller puts it in `headers` with the body hash, and `path_mode = .s3` signs the
-wire path unchanged.
+caller puts it in `headers` with the body hash. For a service named `s3` or one
+that starts with `s3`, `writeAuthorization` refuses a request that leaves it
+out or signs another value with `error.ContentSha256Mismatch`, and refuses a
+path mode other than `.s3` with `error.PathModeMismatch`.
 
 ## Limits
 
 - Presigning: `X-Amz-Signature` in a query string is not built here. `canonical.writeQuery` sorts and encodes the parameters you give it.
 - Streaming signatures: nothing writes `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` or the chunk signatures below it. A body with a streaming hash arrives as a string in `Request.payload_hash`.
 - SigV4a: `sigv4.algorithm` is `AWS4-HMAC-SHA256`, and the chain for `AWS4-ECDSA-P256-SHA256` is not here.
-- S3 without `x-amz-content-sha256`: the library does not add it and does not check it. A caller that leaves it out signs a request that S3 rejects.
+- S3 headers: the library does not add `x-amz-content-sha256`. `writeAuthorization` refuses an S3 request that leaves it out or signs a different value.
 - Retries and skew: no clock and no backoff. `Scope.init` checks the shape of the timestamp, and `writeAuthorization` checks that `x-amz-date` equals it.
 - Credentials: no profile, no STS call, no refresh. `signing.Credentials` holds strings.
-- HTTP: no client, no request type, no header parsing. `Request` is four slices, a hash, and a flag; nothing parses a message.
+- HTTP: no client, no request type, no header parsing. `Request` is four slices, a hash, and a path mode; nothing parses a message.
 
 ## Install
 

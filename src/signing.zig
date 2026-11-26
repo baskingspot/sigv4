@@ -38,8 +38,9 @@ pub const Credentials = struct {
 
 /// What a signing call can refuse: a buffer that was too small, a request
 /// without `host`, a payload hash that is not a hash, a timestamp that is not
-/// `YYYYMMDDTHHMMSSZ` or not the one in the request, or a session token that
-/// the header list already carries.
+/// `YYYYMMDDTHHMMSSZ` or not the one in the request, a session token that the
+/// header list already carries, or an S3 service that does not use the S3 path
+/// mode or does not sign its content hash.
 pub const SignError = error{
     CreqTooSmall,
     OutTooSmall,
@@ -48,6 +49,8 @@ pub const SignError = error{
     InvalidTimestamp,
     DuplicateSessionToken,
     TimestampMismatch,
+    PathModeMismatch,
+    ContentSha256Mismatch,
 };
 
 /// The credential scope, `date/region/service/aws4_request`, with the date
@@ -134,7 +137,8 @@ pub fn signature(key: [32]u8, string_to_sign: []const u8) [32]u8 {
 ///
 /// The request must carry `host` and either an `x-amz-date` equal to
 /// `credentials.timestamp` or a `Date` header. A signature AWS will reject is
-/// not the caller's to make.
+/// not the caller's to make. An S3 service must use `PathMode.s3` and must
+/// sign `x-amz-content-sha256` with the payload hash.
 pub fn writeAuthorization(
     out: []u8,
     creq: []u8,
@@ -150,6 +154,7 @@ pub fn writeAuthorization(
         return error.DuplicateSessionToken;
     }
     try checkTimestamp(request.headers, credentials.timestamp);
+    try checkS3(request, credentials);
 
     const canonical_request = canonical.writeRequestWith(creq, request, extra) catch |err| switch (err) {
         error.NoSpaceLeft => return error.CreqTooSmall,
@@ -158,8 +163,10 @@ pub fn writeAuthorization(
     var digest: [32]u8 = undefined;
     Sha256.hash(canonical_request, &digest, .{});
 
-    const key = signingKey(credentials.secret_key, scope);
+    var key = signingKey(credentials.secret_key, scope);
+    defer zero(&key);
     var sink: Writer.Hashing(HmacSha256) = .initHasher(HmacSha256.init(&key), &.{});
+    defer zero(std.mem.asBytes(&sink));
     writeStringToSignTo(&sink.writer, credentials.timestamp, scope, digest) catch |err| switch (err) {
         // The hashing writer has no sink to fill, so it cannot fail.
         error.WriteFailed => unreachable,
@@ -245,6 +252,19 @@ fn zero(bytes: []u8) void {
     std.crypto.secureZero(u8, bytes);
 }
 
+/// S3 rejects a signature over a service path that was escaped twice, and one
+/// that leaves out the content hash. Both are contradictions the library can
+/// see, so it refuses them here instead of letting AWS answer
+/// SignatureDoesNotMatch.
+fn checkS3(request: canonical.Request, credentials: Credentials) SignError!void {
+    if (!std.mem.startsWith(u8, credentials.service, "s3")) return;
+    if (request.path_mode != .s3) return error.PathModeMismatch;
+    const value = canonical.find(request.headers, "x-amz-content-sha256") orelse
+        return error.ContentSha256Mismatch;
+    const trimmed = std.mem.trim(u8, value, whitespace);
+    if (!std.mem.eql(u8, trimmed, request.payload_hash)) return error.ContentSha256Mismatch;
+}
+
 fn checkTimestamp(headers: []const canonical.Header, timestamp: []const u8) SignError!void {
     if (canonical.find(headers, "x-amz-date")) |value| {
         const trimmed = std.mem.trim(u8, value, whitespace);
@@ -318,7 +338,7 @@ test "the convenience equals the hand-composed field" {
         .access_key = "AKIDEXAMPLE",
         .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
         .region = "us-east-1",
-        .service = "s3",
+        .service = "service",
         .timestamp = "20260826T000000Z",
     };
     const request: canonical.Request = .{
@@ -377,7 +397,7 @@ test "a session token signs the same whether it is listed or injected" {
         .access_key = "AKIDEXAMPLE",
         .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
         .region = "us-east-1",
-        .service = "s3",
+        .service = "service",
         .timestamp = "20260826T000000Z",
     };
 
@@ -425,7 +445,7 @@ test "a token in both the headers and the credentials is refused" {
         .access_key = "AKIDEXAMPLE",
         .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
         .region = "us-east-1",
-        .service = "s3",
+        .service = "service",
         .timestamp = "20260826T000000Z",
         .session_token = "b",
     }));
@@ -511,4 +531,80 @@ test "a short buffer names which one is short" {
     var tiny: [8]u8 = undefined;
     var creq: [1024]u8 = undefined;
     try std.testing.expectError(error.OutTooSmall, writeAuthorization(&tiny, &creq, request, credentials));
+}
+
+test "an S3 service must use the S3 path mode" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
+        .{ .name = "x-amz-content-sha256", .value = canonical.empty_payload_hash },
+    };
+    var field: [512]u8 = undefined;
+    var creq: [1024]u8 = undefined;
+    try std.testing.expectError(error.PathModeMismatch, writeAuthorization(&field, &creq, .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = canonical.empty_payload_hash,
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .timestamp = "20260826T000000Z",
+    }));
+}
+
+test "an S3 request must sign the content hash it carries" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
+    };
+    var field: [512]u8 = undefined;
+    var creq: [1024]u8 = undefined;
+    const credentials: Credentials = .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .timestamp = "20260826T000000Z",
+    };
+    const request: canonical.Request = .{
+        .method = "GET",
+        .path = "/",
+        .path_mode = .s3,
+        .headers = &headers,
+        .payload_hash = canonical.empty_payload_hash,
+    };
+    try std.testing.expectError(error.ContentSha256Mismatch, writeAuthorization(&field, &creq, request, credentials));
+
+    var wrong = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
+        .{ .name = "x-amz-content-sha256", .value = "UNSIGNED-PAYLOAD" },
+    };
+    var other = request;
+    other.headers = &wrong;
+    try std.testing.expectError(error.ContentSha256Mismatch, writeAuthorization(&field, &creq, other, credentials));
+}
+
+test "an s3express service takes the same guard" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
+    };
+    var field: [512]u8 = undefined;
+    var creq: [1024]u8 = undefined;
+    try std.testing.expectError(error.PathModeMismatch, writeAuthorization(&field, &creq, .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = canonical.empty_payload_hash,
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3express",
+        .timestamp = "20260826T000000Z",
+    }));
 }
