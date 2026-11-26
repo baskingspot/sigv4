@@ -162,3 +162,43 @@ test "a timestamp that disagrees with x-amz-date is refused" {
         .timestamp = "20260826T000000Z",
     }));
 }
+
+/// Writes the query string of a presigned S3 GET. This is the README's
+/// presigning example.
+fn presign(query: []u8) sigv4.signing.SignError![]const u8 {
+    var headers = [_]sigv4.canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    return sigv4.signing.presign(query, .{
+        .method = "GET",
+        .path = "/",
+        .path_mode = .s3,
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    }, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .timestamp = "20260826T000000Z",
+    }, .{ .expires_seconds = 3600 });
+}
+
+test "the README presigning example" {
+    var query_buffer: [1024]u8 = undefined;
+
+    // botocore 1.43.79 generates this signature for the same request with
+    // `generate_presigned_url`. It emits `X-Amz-Expires` before
+    // `X-Amz-SignedHeaders`; the suite, and therefore `presign`, writes the
+    // signed headers first.
+    const query = try presign(&query_buffer);
+    try testing.expectEqualStrings(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256" ++
+            "&X-Amz-Credential=AKIDEXAMPLE%2F20260826%2Fus-east-1%2Fs3%2Faws4_request" ++
+            "&X-Amz-Date=20260826T000000Z" ++
+            "&X-Amz-SignedHeaders=host" ++
+            "&X-Amz-Expires=3600" ++
+            "&X-Amz-Signature=97f29a315c8760f950df0e61e9761f4281654f37f0444deeb4b223867ad51318",
+        query,
+    );
+}

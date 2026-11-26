@@ -3,10 +3,10 @@
 
 The official suite (test/fixtures/aws-signing-suite) has no case for a header the
 signer sees but must not sign, duplicate header lines, an empty query
-parameter, a path that needs a second escape, or a session token handed to the
-signer out of band. This script signs one of each with botocore, the signer AWS
-ships in its own Python SDK, and writes the result in the suite's file layout so
-`test/suite.zig` runs both roots with the same code.
+parameter, a path that needs a second escape, a session token handed to the
+signer out of band, or an S3 presigned URL. This script signs one of each with
+botocore, the signer AWS ships in its own Python SDK, and writes the result in
+the suite's file layout so `test/suite.zig` runs both roots with the same code.
 
 Run it from the repository root, with botocore on the interpreter:
 
@@ -18,25 +18,31 @@ The vectors are checked in. Regenerate them only when the shapes change, and
 record the botocore version in test/fixtures/README.md when they do.
 """
 
+import datetime
 import json
 import os
 import sys
+from unittest import mock
 
 import botocore
-from botocore.auth import S3SigV4Auth, SigV4Auth
+from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth, SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
+from botocore.session import Session
+from botocore.signers import RequestSigner
 
 ACCESS_KEY = "AKIDEXAMPLE"
 SECRET_KEY = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
 TIMESTAMP = "20150830T123600Z"
 HOST = "example.amazonaws.com"
+REGION = "us-east-1"
 TOKEN = "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"
+EXPIRES = 3600
 
 OUT_ROOT = os.path.join(os.path.dirname(__file__), "vectors", "v4")
 
 
-def sign(case, method, path, params, headers, region="us-east-1", service="service", token=None, s3=False, wire=None):
+def sign(case, method, path, params, headers, region=REGION, service="service", token=None, s3=False, wire=None):
     """Sign one request with botocore and write the suite's files.
 
     `headers` are the (name, value) pairs the caller sends, in order, and a
@@ -76,10 +82,6 @@ def sign(case, method, path, params, headers, region="us-east-1", service="servi
     if wire is not None:
         target = f"{path}?{wire}"
 
-    request_lines = [f"{method} {target} HTTP/1.1"]
-    request_lines.extend(f"{name}:{value}" for name, value in headers)
-    request_text = "\n".join(request_lines) + "\n\n"
-
     signed_lines = [f"{method} {target} HTTP/1.1"]
     signed_lines.extend(
         f"{name}:{value}"
@@ -89,12 +91,94 @@ def sign(case, method, path, params, headers, region="us-east-1", service="servi
     signed_lines.append(f"Authorization:{request.headers['Authorization']}")
     signed_text = "\n".join(signed_lines) + "\n"
 
+    write(directory, "request.txt", request_text(method, target, headers))
+    write(directory, "context.json", context(region, service, token, s3))
+    write(directory, "header-canonical-request.txt", canonical_request)
+    write(directory, "header-string-to-sign.txt", string_to_sign)
+    write(directory, "header-signature.txt", signature)
+    write(directory, "header-signed-request.txt", signed_text)
+
+
+def presign_case(case, path, token=None, expires=EXPIRES):
+    """Write one presigned S3 case: the query form only.
+
+    `generate_presigned_url` is the call a botocore user makes. It picks the S3
+    query signer, which leaves the canonical URI as the wire path, signs
+    `UNSIGNED-PAYLOAD`, and puts the session token in the query. The same
+    signer driven step by step gives the canonical request, the string to sign,
+    and the signature the suite records; the two URLs must agree, or the files
+    would describe a request botocore does not make.
+
+    There is no header form: `S3SigV4Auth` signs the body hash unless the
+    request carries a checksum header, so the same request cannot be written
+    with `UNSIGNED-PAYLOAD` on its own.
+    """
+    credentials = Credentials(ACCESS_KEY, SECRET_KEY, token)
+    session = Session()
+    model = session.get_service_model("s3")
+    request_dict = {
+        "url": f"https://{HOST}{path}",
+        "method": "GET",
+        "headers": {"Host": HOST},
+        "body": b"",
+        "context": {},
+    }
+
+    # `generate_presigned_url` reads the clock, and a fixture cannot.
+    frozen = datetime.datetime.strptime(TIMESTAMP, "%Y%m%dT%H%M%SZ")
+    signer = RequestSigner(
+        model.service_id,
+        REGION,
+        "s3",
+        "s3v4",
+        credentials,
+        session.get_component("event_emitter"),
+    )
+    with mock.patch("botocore.auth.get_current_datetime", return_value=frozen):
+        url = signer.generate_presigned_url(
+            request_dict, operation_name="GetObject", expires_in=expires, region_name=REGION
+        )
+
+    request = AWSRequest(method="GET", url=f"https://{HOST}{path}", data=None)
+    request.headers.add_header("Host", HOST)
+    request.context["timestamp"] = TIMESTAMP
+    query_auth = S3SigV4QueryAuth(credentials, "s3", REGION, expires=expires)
+    query_auth._modify_request_before_signing(request)
+    canonical_request = query_auth.canonical_request(request)
+    string_to_sign = query_auth.string_to_sign(request, canonical_request)
+    signature = query_auth.signature(string_to_sign, request)
+    query_auth._inject_signature_to_request(request, signature)
+    assert request.url == url, (request.url, url)
+
+    directory = os.path.join(OUT_ROOT, case)
+    os.makedirs(directory, exist_ok=True)
+    target = url.split(f"https://{HOST}", 1)[1]
+    signed_lines = [f"GET {target} HTTP/1.1", f"Host:{HOST}"]
+    write(directory, "request.txt", request_text("GET", path, [("Host", HOST)]))
+    write(
+        directory,
+        "context.json",
+        context(REGION, "s3", token, s3=True, payload_hash="UNSIGNED-PAYLOAD"),
+    )
+    write(directory, "query-canonical-request.txt", canonical_request)
+    write(directory, "query-string-to-sign.txt", string_to_sign)
+    write(directory, "query-signature.txt", signature)
+    write(directory, "query-signed-request.txt", "\n".join(signed_lines) + "\n")
+
+
+def request_text(method, target, headers):
+    lines = [f"{method} {target} HTTP/1.1"]
+    lines.extend(f"{name}:{value}" for name, value in headers)
+    return "\n".join(lines) + "\n\n"
+
+
+def context(region, service, token=None, s3=False, payload_hash=None):
     context = {
         "credentials": {
             "access_key_id": ACCESS_KEY,
             "secret_access_key": SECRET_KEY,
         },
-        "expiration_in_seconds": 3600,
+        "expiration_in_seconds": EXPIRES,
         "normalize": True,
         "region": region,
         "service": service,
@@ -105,13 +189,9 @@ def sign(case, method, path, params, headers, region="us-east-1", service="servi
         context["credentials"]["token"] = TOKEN
     if s3:
         context["path_mode"] = "s3"
-
-    write(directory, "request.txt", request_text)
-    write(directory, "context.json", json.dumps(context, indent=4) + "\n")
-    write(directory, "header-canonical-request.txt", canonical_request)
-    write(directory, "header-string-to-sign.txt", string_to_sign)
-    write(directory, "header-signature.txt", signature)
-    write(directory, "header-signed-request.txt", signed_text)
+    if payload_hash is not None:
+        context["payload_hash"] = payload_hash
+    return json.dumps(context, indent=4) + "\n"
 
 
 def wire_query(params):
@@ -178,6 +258,11 @@ def main():
     # A token from STS: botocore adds the header and signs it, and the caller
     # never holds a second copy of it.
     sign("session-token", "GET", "/", None, [("Host", HOST)], token=TOKEN)
+
+    # An S3 GET presigned with a session token. The key holds a space, a plus,
+    # a percent, and an equals sign, which the S3 signer leaves as the wire
+    # path; the body is UNSIGNED-PAYLOAD, and the token is a query parameter.
+    presign_case("s3-presigned-url", "/a%20b%2Bc%25d%3De", token=TOKEN)
 
     print(f"botocore {botocore.__version__}")
     print(f"wrote {len(os.listdir(OUT_ROOT))} cases to {OUT_ROOT}")

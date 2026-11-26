@@ -106,35 +106,87 @@ pub fn writeRequestWith(out: []u8, request: Request, extra: ?Header) RequestErro
 /// In `.service` mode the path is normalized and encoded again, so an escape
 /// that the wire already has becomes a second escape. In `.s3` mode the bytes
 /// are the canonical URI, so the caller sends an encoded path.
+///
+/// The URI goes into a fixed buffer because a `..` segment removes the bytes
+/// the segment before it wrote, and a writer that has already sent them
+/// cannot take them back.
 pub fn writeUri(out: []u8, path: []const u8, mode: PathMode) WriteError![]const u8 {
     var w: Writer = .fixed(out);
     writePathTo(&w, path, mode) catch return error.NoSpaceLeft;
     return w.buffered();
 }
 
+/// Writes the method, upper case, as the first line of the canonical request.
+pub fn writeMethodInto(w: *Writer, method: []const u8) Writer.Error!void {
+    for (method) |byte| try w.writeByte(ascii.toUpper(byte));
+}
+
 /// Writes the canonical query string, sorting `params` in place by canonical
 /// name and then canonical value.
 pub fn writeQuery(out: []u8, params: []Param) WriteError![]const u8 {
-    mem.sort(Param, params, {}, paramLessThan);
+    sortQuery(params);
     var w: Writer = .fixed(out);
     writeQueryTo(&w, params) catch return error.NoSpaceLeft;
     return w.buffered();
+}
+
+/// Sorts `params` in place in canonical order: by name, then by value, both
+/// compared in their encoded form. This is the order the canonical query
+/// string is written in, and the only state a builder needs.
+pub fn sortQuery(params: []Param) void {
+    mem.sort(Param, params, {}, paramLessThan);
+}
+
+/// Writes one query pair, `name=value`, in canonical form, with no `&` before
+/// it. The caller writes the separators, which is how a presigned query places
+/// its own fields between the parameters it was handed.
+pub fn writeQueryPair(w: *Writer, param: Param) Writer.Error!void {
+    try encode.writeQueryComponent(w, param.name);
+    try w.writeByte('=');
+    try encode.writeQueryComponent(w, param.value);
 }
 
 /// Writes the canonical headers block: one `name:value` line per header, names
 /// case-folded and sorted, values trimmed, duplicate names comma-joined in the
 /// order they arrived. `extra` joins the block the same way it joins a request.
 pub fn writeHeaders(out: []u8, headers: []Header, extra: ?Header) WriteError![]const u8 {
-    mem.sort(Header, headers, {}, headerLessThan);
+    sortHeaders(headers);
     var w: Writer = .fixed(out);
-    writeHeadersTo(&w, headers, extra) catch return error.NoSpaceLeft;
+    writeHeadersInto(&w, headers, extra) catch return error.NoSpaceLeft;
     return w.buffered();
+}
+
+/// Sorts `headers` in place by ASCII case-folded name, which is the order the
+/// canonical header block and the signed-header list are written in.
+pub fn sortHeaders(headers: []Header) void {
+    mem.sort(Header, headers, {}, headerLessThan);
+}
+
+/// The streaming form of `writeHeaders`, for a caller that already owns a
+/// writer. `headers` and `extra` must be sorted.
+pub fn writeHeadersInto(w: *Writer, headers: []const Header, extra: ?Header) Writer.Error!void {
+    var it: Sorted = .init(headers, extra);
+    var current = it.next();
+    while (current) |first| {
+        const name = first.name;
+        try writeLower(w, name);
+        try w.writeByte(':');
+        try writeValue(w, first.value);
+        current = it.next();
+        while (current) |next| {
+            if (nameOrder(next.name, name) != .eq) break;
+            try w.writeByte(',');
+            try writeValue(w, next.value);
+            current = it.next();
+        }
+        try w.writeByte('\n');
+    }
 }
 
 /// Writes the named headers, semicolon separated, with a repeated name listed
 /// once. This is the `SignedHeaders` value of the Authorization field.
 pub fn writeNames(out: []u8, headers: []Header, extra: ?Header) WriteError![]const u8 {
-    mem.sort(Header, headers, {}, headerLessThan);
+    sortHeaders(headers);
     var w: Writer = .fixed(out);
     writeNamesInto(&w, headers, extra) catch return error.NoSpaceLeft;
     return w.buffered();
@@ -158,6 +210,25 @@ pub fn find(headers: []const Header, name: []const u8) ?[]const u8 {
 /// `headers` and `extra` must be sorted; the assertion is here because a
 /// wrong order writes a SignedHeaders value that does not verify.
 pub fn writeNamesInto(w: *Writer, headers: []const Header, extra: ?Header) Writer.Error!void {
+    try writeNamesWith(w, headers, extra, ";", writeLower);
+}
+
+/// The signed-header list as one percent-encoded query value: names
+/// lower-cased, a repeated name listed once, and `;` between them escaped as
+/// `%3B`. This is the `X-Amz-SignedHeaders` value of a presigned URL.
+pub fn writeQueryNamesInto(w: *Writer, headers: []const Header, extra: ?Header) Writer.Error!void {
+    try writeNamesWith(w, headers, extra, "%3B", writeLowerQuery);
+}
+
+/// One list of distinct names. The header form separates with `;` and writes
+/// the name; the query form separates with `%3B` and escapes the name too.
+fn writeNamesWith(
+    w: *Writer,
+    headers: []const Header,
+    extra: ?Header,
+    comptime separator: []const u8,
+    comptime writeName: fn (*Writer, []const u8) Writer.Error!void,
+) Writer.Error!void {
     assert(isSorted(headers, extra));
     var it: Sorted = .init(headers, extra);
     var previous: ?[]const u8 = null;
@@ -166,9 +237,9 @@ pub fn writeNamesInto(w: *Writer, headers: []const Header, extra: ?Header) Write
         if (previous) |name| {
             if (nameOrder(name, header.name) == .eq) continue;
         }
-        if (!first) try w.writeByte(';');
+        if (!first) try w.writeAll(separator);
         first = false;
-        try writeLower(w, header.name);
+        try writeName(w, header.name);
         previous = header.name;
     }
 }
@@ -184,7 +255,10 @@ fn hasHost(headers: []const Header, extra: ?Header) bool {
     return nameOrder(header.name, "host") == .eq;
 }
 
-fn validPayloadHash(hash: []const u8) bool {
+/// True for the payload forms the canonical request accepts: 64 lowercase hex
+/// characters, `UNSIGNED-PAYLOAD`, or a `STREAMING-` form. Uppercase hex and a
+/// raw digest are not a payload hash, so they do not sign in silence.
+pub fn validPayloadHash(hash: []const u8) bool {
     if (mem.eql(u8, hash, "UNSIGNED-PAYLOAD")) return true;
     if (mem.startsWith(u8, hash, "STREAMING-")) return true;
     if (hash.len != 64) return false;
@@ -197,15 +271,15 @@ fn validPayloadHash(hash: []const u8) bool {
 }
 
 fn writeRequestTo(w: *Writer, request: Request, extra: ?Header) Writer.Error!void {
-    mem.sort(Header, request.headers, {}, headerLessThan);
-    mem.sort(Param, request.query, {}, paramLessThan);
-    try writeUpper(w, request.method);
+    sortHeaders(request.headers);
+    sortQuery(request.query);
+    try writeMethodInto(w, request.method);
     try w.writeByte('\n');
     try writePathTo(w, request.path, request.path_mode);
     try w.writeByte('\n');
     try writeQueryTo(w, request.query);
     try w.writeByte('\n');
-    try writeHeadersTo(w, request.headers, extra);
+    try writeHeadersInto(w, request.headers, extra);
     try w.writeByte('\n');
     try writeNamesInto(w, request.headers, extra);
     try w.writeByte('\n');
@@ -260,28 +334,7 @@ fn rewindSegment(w: *Writer, start: usize) void {
 fn writeQueryTo(w: *Writer, params: []const Param) Writer.Error!void {
     for (params, 0..) |param, index| {
         if (index != 0) try w.writeByte('&');
-        try encode.writeQueryComponent(w, param.name);
-        try w.writeByte('=');
-        try encode.writeQueryComponent(w, param.value);
-    }
-}
-
-fn writeHeadersTo(w: *Writer, headers: []const Header, extra: ?Header) Writer.Error!void {
-    var it: Sorted = .init(headers, extra);
-    var current = it.next();
-    while (current) |first| {
-        const name = first.name;
-        try writeLower(w, name);
-        try w.writeByte(':');
-        try writeValue(w, first.value);
-        current = it.next();
-        while (current) |next| {
-            if (nameOrder(next.name, name) != .eq) break;
-            try w.writeByte(',');
-            try writeValue(w, next.value);
-            current = it.next();
-        }
-        try w.writeByte('\n');
+        try writeQueryPair(w, param);
     }
 }
 
@@ -306,8 +359,8 @@ fn writeLower(w: *Writer, bytes: []const u8) Writer.Error!void {
     for (bytes) |byte| try w.writeByte(ascii.toLower(byte));
 }
 
-fn writeUpper(w: *Writer, bytes: []const u8) Writer.Error!void {
-    for (bytes) |byte| try w.writeByte(ascii.toUpper(byte));
+fn writeLowerQuery(w: *Writer, bytes: []const u8) Writer.Error!void {
+    for (bytes) |byte| try encode.writeQueryByte(w, ascii.toLower(byte));
 }
 
 fn headerLessThan(_: void, a: Header, b: Header) bool {
