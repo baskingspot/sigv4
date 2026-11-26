@@ -47,7 +47,7 @@ Not implemented:
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/baskingspot/sigv4
+zig fetch --save https://baskingspot.dev/sigv4/v0.1.0.tar.gz
 ```
 
 Add the module in `build.zig`:
