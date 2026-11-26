@@ -6,11 +6,15 @@
 //! form `20150830T123600Z`.
 
 const std = @import("std");
-const canonical = @import("canonical.zig");
-
-const Sha256 = std.crypto.hash.sha2.Sha256;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const mem = std.mem;
+const crypto = std.crypto;
+const Sha256 = crypto.hash.sha2.Sha256;
+const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Writer = std.Io.Writer;
+const testing = std.testing;
+const ascii = std.ascii;
+
+const canonical = @import("canonical.zig");
 
 /// The algorithm named in the string to sign and the Authorization field.
 /// SigV4a uses another one.
@@ -88,7 +92,12 @@ pub fn writeStringToSign(
     canonical_request_hash: [32]u8,
 ) canonical.WriteError![]const u8 {
     var w: Writer = .fixed(out);
-    writeStringToSignTo(&w, timestamp, scope, canonical_request_hash) catch return error.NoSpaceLeft;
+    writeStringToSignTo(
+        &w,
+        timestamp,
+        scope,
+        canonical_request_hash,
+    ) catch return error.NoSpaceLeft;
     return w.buffered();
 }
 
@@ -97,7 +106,7 @@ pub fn writeStringToSign(
 /// string to sign.
 pub fn signingKey(secret_key: []const u8, scope: Scope) [32]u8 {
     var hmac = secretKeyHmac(secret_key);
-    defer zero(std.mem.asBytes(&hmac));
+    defer zero(mem.asBytes(&hmac));
 
     var date_key: [32]u8 = undefined;
     hmac.update(&scope.date);
@@ -145,7 +154,7 @@ pub fn writeAuthorization(
     request: canonical.Request,
     credentials: Credentials,
 ) SignError![]const u8 {
-    const scope = try Scope.init(credentials.timestamp, credentials.region, credentials.service);
+    const scope: Scope = try .init(credentials.timestamp, credentials.region, credentials.service);
     const extra: ?canonical.Header = if (credentials.session_token) |token|
         .{ .name = session_token_header, .value = token }
     else
@@ -156,9 +165,13 @@ pub fn writeAuthorization(
     try checkTimestamp(request.headers, credentials.timestamp);
     try checkS3(request, credentials);
 
-    const canonical_request = canonical.writeRequestWith(creq, request, extra) catch |err| switch (err) {
-        error.NoSpaceLeft => return error.CreqTooSmall,
-        else => |other| return other,
+    const canonical_request = canonical.writeRequestWith(
+        creq,
+        request,
+        extra,
+    ) catch |err| return switch (err) {
+        error.NoSpaceLeft => error.CreqTooSmall,
+        else => |other| other,
     };
     var digest: [32]u8 = undefined;
     Sha256.hash(canonical_request, &digest, .{});
@@ -166,11 +179,13 @@ pub fn writeAuthorization(
     var key = signingKey(credentials.secret_key, scope);
     defer zero(&key);
     var sink: Writer.Hashing(HmacSha256) = .initHasher(HmacSha256.init(&key), &.{});
-    defer zero(std.mem.asBytes(&sink));
-    writeStringToSignTo(&sink.writer, credentials.timestamp, scope, digest) catch |err| switch (err) {
-        // The hashing writer has no sink to fill, so it cannot fail.
-        error.WriteFailed => unreachable,
-    };
+    defer zero(mem.asBytes(&sink));
+    writeStringToSignTo(
+        &sink.writer,
+        credentials.timestamp,
+        scope,
+        digest,
+    ) catch unreachable; // The hashing writer has no sink to fill, so it cannot fail.
     var mac: [32]u8 = undefined;
     sink.hasher.final(&mac);
 
@@ -248,8 +263,8 @@ fn secretKeyHmac(secret_key: []const u8) HmacSha256 {
     return HmacSha256.init(&digest);
 }
 
-fn zero(bytes: []u8) void {
-    std.crypto.secureZero(u8, bytes);
+inline fn zero(bytes: []u8) void {
+    crypto.secureZero(u8, bytes);
 }
 
 /// S3 rejects a signature over a service path that was escaped twice, and one
@@ -257,18 +272,18 @@ fn zero(bytes: []u8) void {
 /// see, so it refuses them here instead of letting AWS answer
 /// SignatureDoesNotMatch.
 fn checkS3(request: canonical.Request, credentials: Credentials) SignError!void {
-    if (!std.mem.startsWith(u8, credentials.service, "s3")) return;
+    if (!mem.startsWith(u8, credentials.service, "s3")) return;
     if (request.path_mode != .s3) return error.PathModeMismatch;
     const value = canonical.find(request.headers, "x-amz-content-sha256") orelse
         return error.ContentSha256Mismatch;
-    const trimmed = std.mem.trim(u8, value, whitespace);
-    if (!std.mem.eql(u8, trimmed, request.payload_hash)) return error.ContentSha256Mismatch;
+    const trimmed = mem.trim(u8, value, whitespace);
+    if (!mem.eql(u8, trimmed, request.payload_hash)) return error.ContentSha256Mismatch;
 }
 
 fn checkTimestamp(headers: []const canonical.Header, timestamp: []const u8) SignError!void {
     if (canonical.find(headers, "x-amz-date")) |value| {
-        const trimmed = std.mem.trim(u8, value, whitespace);
-        if (!std.mem.eql(u8, trimmed, timestamp)) return error.TimestampMismatch;
+        const trimmed = mem.trim(u8, value, whitespace);
+        if (!mem.eql(u8, trimmed, timestamp)) return error.TimestampMismatch;
         return;
     }
     if (canonical.contains(headers, "date")) return;
@@ -278,38 +293,38 @@ fn checkTimestamp(headers: []const canonical.Header, timestamp: []const u8) Sign
 fn validTimestamp(timestamp: []const u8) bool {
     if (timestamp.len != 16) return false;
     for (timestamp[0..8]) |byte| {
-        if (!std.ascii.isDigit(byte)) return false;
+        if (!ascii.isDigit(byte)) return false;
     }
     for (timestamp[9..15]) |byte| {
-        if (!std.ascii.isDigit(byte)) return false;
+        if (!ascii.isDigit(byte)) return false;
     }
     return timestamp[8] == 'T' and timestamp[15] == 'Z';
 }
 
 test "the scope date comes from the timestamp" {
-    const scope = try Scope.init("20150830T123600Z", "us-east-1", "service");
-    try std.testing.expectEqualStrings("20150830", &scope.date);
+    const scope: Scope = try .init("20150830T123600Z", "us-east-1", "service");
+    try testing.expectEqualStrings("20150830", &scope.date);
 
     var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings(
+    try testing.expectEqualStrings(
         "20150830/us-east-1/service/aws4_request",
         try writeScope(&buffer, scope),
     );
 }
 
 test "a timestamp that is not the basic ISO form is refused" {
-    try std.testing.expectError(error.InvalidTimestamp, Scope.init("2015-08-30T12:36:00Z", "r", "s"));
-    try std.testing.expectError(error.InvalidTimestamp, Scope.init("20150830T1236Z", "r", "s"));
-    try std.testing.expectError(error.InvalidTimestamp, Scope.init("20150830X123600Z", "r", "s"));
-    try std.testing.expectError(error.InvalidTimestamp, Scope.init("20150830T123600Y", "r", "s"));
+    try testing.expectError(error.InvalidTimestamp, Scope.init("2015-08-30T12:36:00Z", "r", "s"));
+    try testing.expectError(error.InvalidTimestamp, Scope.init("20150830T1236Z", "r", "s"));
+    try testing.expectError(error.InvalidTimestamp, Scope.init("20150830X123600Z", "r", "s"));
+    try testing.expectError(error.InvalidTimestamp, Scope.init("20150830T123600Y", "r", "s"));
 }
 
 test "the signing key is the documented chain" {
     // The worked example in the AWS documentation: the IAM ListUsers request
     // of 20150830T123600Z.
-    const scope = try Scope.init("20150830T123600Z", "us-east-1", "iam");
+    const scope: Scope = try .init("20150830T123600Z", "us-east-1", "iam");
     const key = signingKey("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", scope);
-    try std.testing.expectEqualStrings(
+    try testing.expectEqualStrings(
         "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9",
         &std.fmt.bytesToHex(key, .lower),
     );
@@ -322,8 +337,8 @@ test "a secret longer than one hash block still signs" {
     const long: []const u8 =
         "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" ++
         "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
-    const scope = try Scope.init("20150830T123600Z", "us-east-1", "iam");
-    try std.testing.expectEqualStrings(
+    const scope: Scope = try .init("20150830T123600Z", "us-east-1", "iam");
+    try testing.expectEqualStrings(
         "ebb29ad5a9a9c048c0c40f2b16feabaa95d61580e1211918763b6710d9245b01",
         &std.fmt.bytesToHex(signingKey(long, scope), .lower),
     );
@@ -352,7 +367,7 @@ test "the convenience equals the hand-composed field" {
     var creq: [1024]u8 = undefined;
     const value = try writeAuthorization(&field, &creq, request, credentials);
 
-    const scope = try Scope.init(credentials.timestamp, credentials.region, credentials.service);
+    const scope: Scope = try .init(credentials.timestamp, credentials.region, credentials.service);
     var hand_creq: [1024]u8 = undefined;
     const hand_canonical = try canonical.writeRequest(&hand_creq, request);
     var digest: [32]u8 = undefined;
@@ -378,8 +393,8 @@ test "the convenience equals the hand-composed field" {
 
     // The whole convenience is the four primitives in a row, with no path of
     // its own through the format.
-    try std.testing.expectEqualStrings(hand_canonical, creq[0..hand_canonical.len]);
-    try std.testing.expectEqualStrings(w.buffered(), value);
+    try testing.expectEqualStrings(hand_canonical, creq[0..hand_canonical.len]);
+    try testing.expectEqualStrings(w.buffered(), value);
 }
 
 test "a session token signs the same whether it is listed or injected" {
@@ -426,7 +441,7 @@ test "a session token signs the same whether it is listed or injected" {
         .payload_hash = canonical.empty_payload_hash,
     }, base);
 
-    try std.testing.expectEqualStrings(listed, injected);
+    try testing.expectEqualStrings(listed, injected);
 }
 
 test "a token in both the headers and the credentials is refused" {
@@ -436,7 +451,7 @@ test "a token in both the headers and the credentials is refused" {
     };
     var field: [512]u8 = undefined;
     var creq: [1024]u8 = undefined;
-    try std.testing.expectError(error.DuplicateSessionToken, writeAuthorization(&field, &creq, .{
+    try testing.expectError(error.DuplicateSessionToken, writeAuthorization(&field, &creq, .{
         .method = "GET",
         .path = "/",
         .headers = &headers,
@@ -456,7 +471,7 @@ test "a buffer that is too small is refused" {
         .{ .name = "host", .value = "example.amazonaws.com" },
     };
     var small: [8]u8 = undefined;
-    try std.testing.expectError(error.NoSpaceLeft, canonical.writeRequest(&small, .{
+    try testing.expectError(error.NoSpaceLeft, canonical.writeRequest(&small, .{
         .method = "GET",
         .path = "/",
         .headers = &headers,
@@ -483,7 +498,7 @@ test "a Date header stands in for x-amz-date" {
         .service = "service",
         .timestamp = "20150830T123600Z",
     });
-    try std.testing.expect(std.mem.find(u8, value, "SignedHeaders=date;host") != null);
+    try testing.expect(mem.find(u8, value, "SignedHeaders=date;host") != null);
 }
 
 test "a request with no date at all is refused" {
@@ -492,7 +507,7 @@ test "a request with no date at all is refused" {
     };
     var field: [512]u8 = undefined;
     var creq: [1024]u8 = undefined;
-    try std.testing.expectError(error.TimestampMismatch, writeAuthorization(&field, &creq, .{
+    try testing.expectError(error.TimestampMismatch, writeAuthorization(&field, &creq, .{
         .method = "GET",
         .path = "/",
         .headers = &headers,
@@ -526,11 +541,17 @@ test "a short buffer names which one is short" {
     };
     var field: [512]u8 = undefined;
     var small: [8]u8 = undefined;
-    try std.testing.expectError(error.CreqTooSmall, writeAuthorization(&field, &small, request, credentials));
+    try testing.expectError(
+        error.CreqTooSmall,
+        writeAuthorization(&field, &small, request, credentials),
+    );
 
     var tiny: [8]u8 = undefined;
     var creq: [1024]u8 = undefined;
-    try std.testing.expectError(error.OutTooSmall, writeAuthorization(&tiny, &creq, request, credentials));
+    try testing.expectError(
+        error.OutTooSmall,
+        writeAuthorization(&tiny, &creq, request, credentials),
+    );
 }
 
 test "an S3 service must use the S3 path mode" {
@@ -541,7 +562,7 @@ test "an S3 service must use the S3 path mode" {
     };
     var field: [512]u8 = undefined;
     var creq: [1024]u8 = undefined;
-    try std.testing.expectError(error.PathModeMismatch, writeAuthorization(&field, &creq, .{
+    try testing.expectError(error.PathModeMismatch, writeAuthorization(&field, &creq, .{
         .method = "GET",
         .path = "/",
         .headers = &headers,
@@ -576,7 +597,10 @@ test "an S3 request must sign the content hash it carries" {
         .headers = &headers,
         .payload_hash = canonical.empty_payload_hash,
     };
-    try std.testing.expectError(error.ContentSha256Mismatch, writeAuthorization(&field, &creq, request, credentials));
+    try testing.expectError(
+        error.ContentSha256Mismatch,
+        writeAuthorization(&field, &creq, request, credentials),
+    );
 
     var wrong = [_]canonical.Header{
         .{ .name = "host", .value = "example.amazonaws.com" },
@@ -585,7 +609,10 @@ test "an S3 request must sign the content hash it carries" {
     };
     var other = request;
     other.headers = &wrong;
-    try std.testing.expectError(error.ContentSha256Mismatch, writeAuthorization(&field, &creq, other, credentials));
+    try testing.expectError(
+        error.ContentSha256Mismatch,
+        writeAuthorization(&field, &creq, other, credentials),
+    );
 }
 
 test "an s3express service takes the same guard" {
@@ -595,7 +622,7 @@ test "an s3express service takes the same guard" {
     };
     var field: [512]u8 = undefined;
     var creq: [1024]u8 = undefined;
-    try std.testing.expectError(error.PathModeMismatch, writeAuthorization(&field, &creq, .{
+    try testing.expectError(error.PathModeMismatch, writeAuthorization(&field, &creq, .{
         .method = "GET",
         .path = "/",
         .headers = &headers,

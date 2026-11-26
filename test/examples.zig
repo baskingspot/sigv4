@@ -62,7 +62,7 @@ test "build the four stages by hand" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(canonical, &digest, .{});
 
-    const scope = try sigv4.signing.Scope.init("20260826T000000Z", "us-east-1", "s3");
+    const scope: sigv4.signing.Scope = try .init("20260826T000000Z", "us-east-1", "s3");
     var sts_buffer: [512]u8 = undefined;
     const string_to_sign = try sigv4.signing.writeStringToSign(&sts_buffer, "20260826T000000Z", scope, digest);
 

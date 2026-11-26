@@ -15,11 +15,13 @@
 
 const std = @import("std");
 const testing = std.testing;
-const sigv4 = @import("sigv4");
-
+const mem = std.mem;
 const Io = std.Io;
-const Allocator = std.mem.Allocator;
+const ascii = std.ascii;
+const Allocator = mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+
+const sigv4 = @import("sigv4");
 
 const suite_root = "test/fixtures/aws-signing-suite/v4";
 const vector_root = "test/fixtures/vectors/v4";
@@ -134,7 +136,7 @@ fn runVariant(
 
     var digest: [32]u8 = undefined;
     Sha256.hash(canonical, &digest, .{});
-    const scope = try sigv4.signing.Scope.init(context.timestamp, context.region, context.service);
+    const scope: sigv4.signing.Scope = try .init(context.timestamp, context.region, context.service);
 
     var string_buffer: [1024]u8 = undefined;
     const string_to_sign = try sigv4.signing.writeStringToSign(&string_buffer, context.timestamp, scope, digest);
@@ -178,10 +180,10 @@ fn selectHeaders(
 
     var selected: std.ArrayList(sigv4.canonical.Header) = .empty;
     for (names) |name| {
-        if (std.ascii.eqlIgnoreCase(name, sigv4.signing.session_token_header)) continue;
+        if (ascii.eqlIgnoreCase(name, sigv4.signing.session_token_header)) continue;
         var found = false;
         for (source.items) |header| {
-            if (!std.ascii.eqlIgnoreCase(header.name, name)) continue;
+            if (!ascii.eqlIgnoreCase(header.name, name)) continue;
             try selected.append(arena, .{ .name = name, .value = header.value });
             found = true;
         }
@@ -204,35 +206,35 @@ const Header = struct {
 };
 
 fn parseRequest(arena: Allocator, text: []const u8) !Wire {
-    const head_end = std.mem.indexOf(u8, text, "\n\n") orelse text.len;
+    const head_end = mem.indexOf(u8, text, "\n\n") orelse text.len;
     const body = if (head_end < text.len) text[head_end + 2 ..] else text[text.len..];
-    var lines = std.mem.splitScalar(u8, text[0..head_end], '\n');
+    var lines = mem.splitScalar(u8, text[0..head_end], '\n');
 
-    const request_line = std.mem.trimEnd(u8, lines.next() orelse return error.MalformedRequest, "\r");
+    const request_line = mem.trimEnd(u8, lines.next() orelse return error.MalformedRequest, "\r");
     // The suite has targets with a raw space in the path, so the target runs
     // from the first space to the last one, not to the next word.
-    const first = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.MalformedRequest;
-    const version_at = std.mem.findScalarLast(u8, request_line, ' ') orelse return error.MalformedRequest;
+    const first = mem.indexOfScalar(u8, request_line, ' ') orelse return error.MalformedRequest;
+    const version_at = mem.findScalarLast(u8, request_line, ' ') orelse return error.MalformedRequest;
     if (version_at <= first) return error.MalformedRequest;
     const method = request_line[0..first];
     const target = request_line[first + 1 .. version_at];
 
     var headers: std.ArrayList(Header) = .empty;
     while (lines.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
+        const line = mem.trimEnd(u8, raw, "\r");
         if (line.len == 0) continue;
         if (line[0] == ' ' or line[0] == '\t') {
             if (headers.items.len == 0) return error.MalformedRequest;
             const last = &headers.items[headers.items.len - 1];
-            const continuation = std.mem.trim(u8, line, " \t");
-            last.value = try std.mem.concat(arena, u8, &.{ last.value, " ", continuation });
+            const continuation = mem.trim(u8, line, " \t");
+            last.value = try mem.concat(arena, u8, &.{ last.value, " ", continuation });
             continue;
         }
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedRequest;
+        const colon = mem.indexOfScalar(u8, line, ':') orelse return error.MalformedRequest;
         try headers.append(arena, .{ .name = line[0..colon], .value = line[colon + 1 ..] });
     }
 
-    const question = std.mem.indexOfScalar(u8, target, '?');
+    const question = mem.indexOfScalar(u8, target, '?');
     return .{
         .method = method,
         .path = if (question) |index| target[0..index] else target,
@@ -244,10 +246,10 @@ fn parseRequest(arena: Allocator, text: []const u8) !Wire {
 
 fn parseQuery(arena: Allocator, query: []const u8) ![]sigv4.canonical.Param {
     var params: std.ArrayList(sigv4.canonical.Param) = .empty;
-    var pairs = std.mem.splitScalar(u8, query, '&');
+    var pairs = mem.splitScalar(u8, query, '&');
     while (pairs.next()) |pair| {
         if (pair.len == 0) continue;
-        const equals = std.mem.indexOfScalar(u8, pair, '=');
+        const equals = mem.indexOfScalar(u8, pair, '=');
         if (equals) |index| {
             try params.append(arena, .{ .name = pair[0..index], .value = pair[index + 1 ..] });
         } else {
@@ -264,8 +266,8 @@ fn parseQuery(arena: Allocator, query: []const u8) ![]sigv4.canonical.Param {
 fn presignedParams(arena: Allocator, query: []const u8, with_token: bool) ![]sigv4.canonical.Param {
     var kept: std.ArrayList(sigv4.canonical.Param) = .empty;
     for (try parseQuery(arena, query)) |param| {
-        if (std.mem.eql(u8, param.name, "X-Amz-Signature")) continue;
-        if (!with_token and std.mem.eql(u8, param.name, "X-Amz-Security-Token")) continue;
+        if (mem.eql(u8, param.name, "X-Amz-Signature")) continue;
+        if (!with_token and mem.eql(u8, param.name, "X-Amz-Security-Token")) continue;
         try kept.append(arena, param);
     }
     return kept.toOwnedSlice(arena);
@@ -317,9 +319,9 @@ fn parseContext(arena: Allocator, text: []const u8) !Context {
 }
 
 fn parsePathMode(name: []const u8) !sigv4.canonical.PathMode {
-    if (std.mem.eql(u8, name, "service")) return .service;
-    if (std.mem.eql(u8, name, "unnormalized")) return .unnormalized;
-    if (std.mem.eql(u8, name, "s3")) return .s3;
+    if (mem.eql(u8, name, "service")) return .service;
+    if (mem.eql(u8, name, "unnormalized")) return .unnormalized;
+    if (mem.eql(u8, name, "s3")) return .s3;
     return error.MalformedContext;
 }
 
@@ -341,15 +343,15 @@ fn payloadHash(arena: Allocator, body: []const u8, sign_body: bool) ![]const u8 
 
 fn signedNames(arena: Allocator, authorization: []const u8) ![]const []const u8 {
     const marker = "SignedHeaders=";
-    const start = std.mem.indexOf(u8, authorization, marker) orelse return error.NoSignedHeaders;
+    const start = mem.indexOf(u8, authorization, marker) orelse return error.NoSignedHeaders;
     const rest = authorization[start + marker.len ..];
-    const end = std.mem.indexOf(u8, rest, ", ") orelse rest.len;
+    const end = mem.indexOf(u8, rest, ", ") orelse rest.len;
     return splitNames(arena, rest[0..end]);
 }
 
 fn splitNames(arena: Allocator, names: []const u8) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    var parts = std.mem.splitScalar(u8, names, ';');
+    var parts = mem.splitScalar(u8, names, ';');
     while (parts.next()) |part| {
         if (part.len == 0) continue;
         try list.append(arena, part);
@@ -359,7 +361,7 @@ fn splitNames(arena: Allocator, names: []const u8) ![]const []const u8 {
 
 fn presignedNames(arena: Allocator, params: []const sigv4.canonical.Param) ![]const []const u8 {
     for (params) |param| {
-        if (!std.mem.eql(u8, param.name, "X-Amz-SignedHeaders")) continue;
+        if (!mem.eql(u8, param.name, "X-Amz-SignedHeaders")) continue;
         return splitNames(arena, try percentDecode(arena, param.value));
     }
     return error.NoSignedHeaders;
@@ -395,7 +397,7 @@ fn hexDigit(byte: u8) ?u8 {
 
 fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
     for (headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+        if (ascii.eqlIgnoreCase(header.name, name)) return header.value;
     }
     return null;
 }
@@ -416,5 +418,5 @@ fn readOptional(io: Io, dir: Io.Dir, arena: Allocator, name: []const u8) !?[]u8 
 }
 
 fn joined(arena: Allocator, prefix: []const u8, suffix: []const u8) ![]const u8 {
-    return std.mem.concat(arena, u8, &.{ prefix, suffix });
+    return mem.concat(arena, u8, &.{ prefix, suffix });
 }

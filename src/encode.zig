@@ -3,7 +3,7 @@
 //! query keeps a %XX that the wire already has, because it takes wire text.
 
 const std = @import("std");
-
+const testing = std.testing;
 const Writer = std.Io.Writer;
 
 const upper_hex = "0123456789ABCDEF";
@@ -134,63 +134,63 @@ test "every unreserved byte stays literal" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
     try writeQueryComponent(&w, "abcXYZ019-._~");
-    try std.testing.expectEqualStrings("abcXYZ019-._~", w.buffered());
+    try testing.expectEqualStrings("abcXYZ019-._~", w.buffered());
 }
 
 test "a reserved byte uses uppercase hex" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
     try writeQueryComponent(&w, "a b&c=d");
-    try std.testing.expectEqualStrings("a%20b%26c%3Dd", w.buffered());
+    try testing.expectEqualStrings("a%20b%26c%3Dd", w.buffered());
 }
 
 test "a written escape is decoded and re-encoded" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
     try writeQueryComponent(&w, "a%20b%e1%88%B4");
-    try std.testing.expectEqualStrings("a%20b%E1%88%B4", w.buffered());
+    try testing.expectEqualStrings("a%20b%E1%88%B4", w.buffered());
 
     var other: [64]u8 = undefined;
     var w2: Writer = .fixed(&other);
     try writeQueryComponent(&w2, "%7e%2f%41%25");
-    try std.testing.expectEqualStrings("~%2FA%25", w2.buffered());
+    try testing.expectEqualStrings("~%2FA%25", w2.buffered());
 }
 
 test "a literal percent must arrive as an escape" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
     try writeQueryComponent(&w, "100%");
-    try std.testing.expectEqualStrings("100%25", w.buffered());
+    try testing.expectEqualStrings("100%25", w.buffered());
 
     var other: [64]u8 = undefined;
     var w2: Writer = .fixed(&other);
     try writeQueryComponent(&w2, "a%zz");
-    try std.testing.expectEqualStrings("a%25zz", w2.buffered());
+    try testing.expectEqualStrings("a%25zz", w2.buffered());
 }
 
 test "a path segment escapes everything else, the escape included" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
     try writePathSegment(&w, "a%20b c");
-    try std.testing.expectEqualStrings("a%2520b%20c", w.buffered());
+    try testing.expectEqualStrings("a%2520b%20c", w.buffered());
 }
 
 test "a decoded byte and its escape compare equal" {
-    try std.testing.expectEqual(std.math.Order.eq, order("a b", "a%20b"));
-    try std.testing.expectEqual(std.math.Order.lt, order("%20", "a"));
-    try std.testing.expectEqual(std.math.Order.gt, order("a", "%20"));
+    try testing.expectEqual(std.math.Order.eq, order("a b", "a%20b"));
+    try testing.expectEqual(std.math.Order.lt, order("%20", "a"));
+    try testing.expectEqual(std.math.Order.gt, order("a", "%20"));
 }
 
 test "order reads canonical bytes, not raw ones" {
     // A raw '.' (0x2e) sorts before a raw '/' (0x2f), but '/' encodes to
     // '%2F', and '%' (0x25) sorts before '.'.
-    try std.testing.expectEqual(std.math.Order.lt, order("/", "."));
-    try std.testing.expectEqual(std.math.Order.gt, order(".", "/"));
+    try testing.expectEqual(std.math.Order.lt, order("/", "."));
+    try testing.expectEqual(std.math.Order.gt, order(".", "/"));
 }
 
 test "an escape and the byte it names compare equal" {
-    try std.testing.expectEqual(std.math.Order.eq, order("%2f", "%2F"));
-    try std.testing.expectEqual(std.math.Order.eq, order("%7e", "~"));
-    try std.testing.expectEqual(std.math.Order.eq, order("%41", "A"));
-    try std.testing.expectEqual(std.math.Order.eq, order("%25", "%"));
+    try testing.expectEqual(std.math.Order.eq, order("%2f", "%2F"));
+    try testing.expectEqual(std.math.Order.eq, order("%7e", "~"));
+    try testing.expectEqual(std.math.Order.eq, order("%41", "A"));
+    try testing.expectEqual(std.math.Order.eq, order("%25", "%"));
 }
