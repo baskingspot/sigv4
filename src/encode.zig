@@ -25,6 +25,17 @@ pub fn writeQueryComponent(w: *Writer, bytes: []const u8) Writer.Error!void {
     while (canonical.next()) |byte| try w.writeByte(byte);
 }
 
+/// Writes one byte of a query name or value in canonical form: an unreserved
+/// byte stays literal and every other byte becomes uppercase %XX. The byte is
+/// taken as the byte it is, not as wire text, so `%` becomes `%25`.
+pub fn writeQueryByte(w: *Writer, byte: u8) Writer.Error!void {
+    if (unreserved(byte)) {
+        try w.writeByte(byte);
+    } else {
+        try writeEscape(w, byte);
+    }
+}
+
 /// Writes a path with its `/` separators left literal and every other byte
 /// outside the unreserved set escaped, with no dot-segment removal.
 pub fn writePath(w: *Writer, path: []const u8) Writer.Error!void {

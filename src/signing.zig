@@ -1,4 +1,5 @@
-//! The signing key, the string to sign, and the Authorization field value.
+//! The signing key, the string to sign, the Authorization field value, and the
+//! query string of a presigned URL.
 //!
 //! The key is the HMAC chain the specification names: `AWS4` + secret over the
 //! date, then the region, then the service, then `aws4_request`. Nothing here
@@ -15,17 +16,29 @@ const testing = std.testing;
 const ascii = std.ascii;
 
 const canonical = @import("canonical.zig");
+const encode = @import("encode.zig");
 
 /// The algorithm named in the string to sign and the Authorization field.
 /// SigV4a uses another one.
 pub const algorithm = "AWS4-HMAC-SHA256";
 
+/// The longest a presigned URL may work: one week, the cap AWS puts on
+/// `X-Amz-Expires`.
+pub const max_expires_seconds: u32 = 7 * 24 * 60 * 60;
+
 /// The header a session token is signed under.
 pub const session_token_header = "x-amz-security-token";
+
+/// The query parameter a presigned URL carries a session token in.
+pub const session_token_query = "X-Amz-Security-Token";
 
 const scope_terminator = "aws4_request";
 
 const whitespace = " \t\n\r\x0b\x0c";
+
+/// The prefix the presigned form owns. AWS reserves it for the parameters in
+/// the query that carry the signature.
+const reserved_prefix = "x-amz-";
 
 /// Everything a signature needs that is not the request.
 pub const Credentials = struct {
@@ -43,18 +56,27 @@ pub const Credentials = struct {
 /// What a signing call can refuse: a buffer that was too small, a request
 /// without `host`, a payload hash that is not a hash, a timestamp that is not
 /// `YYYYMMDDTHHMMSSZ` or not the one in the request, a session token that the
-/// header list already carries, or an S3 service that does not use the S3 path
-/// mode or does not sign its content hash.
+/// header list already carries, a presigned URL that would live longer than a
+/// week, a caller parameter that a reserved query name owns, or an S3 service
+/// that does not use the S3 path mode or does not sign its content hash.
 pub const SignError = error{
     CreqTooSmall,
     OutTooSmall,
     MissingHost,
     InvalidPayloadHash,
     InvalidTimestamp,
+    InvalidExpires,
     DuplicateSessionToken,
+    ReservedQueryParameter,
     TimestampMismatch,
     PathModeMismatch,
     ContentSha256Mismatch,
+};
+
+/// What a presigned URL takes besides the request and the credentials.
+pub const Options = struct {
+    /// How long the URL works, in seconds, from 1 to `max_expires_seconds`.
+    expires_seconds: u32,
 };
 
 /// The credential scope, `date/region/service/aws4_request`, with the date
@@ -194,6 +216,96 @@ pub fn writeAuthorization(
     return w.buffered();
 }
 
+/// Writes the query string of a presigned URL: the caller's parameters in the
+/// order it holds them, then `X-Amz-Algorithm`, `X-Amz-Credential`,
+/// `X-Amz-Date`, `X-Amz-SignedHeaders`, `X-Amz-Expires`,
+/// `X-Amz-Security-Token` when a token is present, and `X-Amz-Signature`
+/// last.
+///
+/// `request.headers` is the set of headers the signature covers, as it is for
+/// the header form: pass `host` alone for the ordinary presigned URL, and add
+/// a header only when the recipient must send it, because a signed header the
+/// recipient leaves out fails the signature. `host` is required.
+///
+/// `out` also holds the escaped canonical URI while the signature is computed.
+/// A `..` segment removes the bytes the segment before it wrote, and a writer
+/// cannot take bytes back, so the URI cannot be streamed. Size `out` for the
+/// escaped path and the query.
+///
+/// `request.query` and `request.headers` are sorted in place, because the
+/// canonical request sorts and the caller owns the buffers.
+///
+/// The signature covers `request.payload_hash` as given. S3 answers only a
+/// presigned URL that carries `UNSIGNED-PAYLOAD`, so that is the caller's
+/// choice; the query form has no `x-amz-content-sha256` header, and this
+/// writes none.
+pub fn presign(
+    out: []u8,
+    request: canonical.Request,
+    credentials: Credentials,
+    options: Options,
+) SignError![]const u8 {
+    if (options.expires_seconds == 0 or options.expires_seconds > max_expires_seconds) {
+        return error.InvalidExpires;
+    }
+    if (!canonical.validPayloadHash(request.payload_hash)) return error.InvalidPayloadHash;
+    const scope = try Scope.init(credentials.timestamp, credentials.region, credentials.service);
+    if (!canonical.contains(request.headers, "host")) return error.MissingHost;
+    try checkPresignedS3(request, credentials);
+    for (request.query) |param| {
+        if (isReserved(param.name)) return error.ReservedQueryParameter;
+    }
+
+    const fields: Fields = .{
+        .access_key = credentials.access_key,
+        .scope = scope,
+        .timestamp = credentials.timestamp,
+        .expires_seconds = options.expires_seconds,
+        .session_token = credentials.session_token,
+        .headers = request.headers,
+    };
+
+    // The caller's parameters keep the order the caller holds them, so they
+    // are written before the sort. The signed-header names are only ever read
+    // sorted, so they are sorted before either query is written.
+    canonical.sortHeaders(request.headers);
+
+    var w: Writer = .fixed(out);
+    writeCallerQuery(&w, request.query) catch return error.OutTooSmall;
+    const uri_offset = w.end;
+    const uri = canonical.writeUri(out[uri_offset..], request.path, request.path_mode) catch
+        return error.OutTooSmall;
+
+    canonical.sortQuery(request.query);
+
+    var hasher: Writer.Hashing(Sha256) = .initHasher(Sha256.init(.{}), &.{});
+    writeCanonicalRequest(&hasher.writer, request, uri, fields) catch |err| switch (err) {
+        // The hashing writer has no sink to fill, so it cannot fail.
+        error.WriteFailed => unreachable,
+    };
+    var digest: [32]u8 = undefined;
+    hasher.hasher.final(&digest);
+
+    var key = signingKey(credentials.secret_key, scope);
+    defer zero(&key);
+    var sink: Writer.Hashing(HmacSha256) = .initHasher(HmacSha256.init(&key), &.{});
+    defer zero(std.mem.asBytes(&sink));
+    writeStringToSignTo(&sink.writer, credentials.timestamp, scope, digest) catch |err| switch (err) {
+        // The hashing writer has no sink to fill, so it cannot fail.
+        error.WriteFailed => unreachable,
+    };
+    var mac: [32]u8 = undefined;
+    sink.hasher.final(&mac);
+
+    // The fields replace the URI in the buffer, which has been hashed.
+    const separator: []const u8 = if (request.query.len == 0) "" else "&";
+    writePresignedFields(&w, fields, separator) catch return error.OutTooSmall;
+    const hex = std.fmt.bytesToHex(mac, .lower);
+    w.writeAll("&X-Amz-Signature=") catch return error.OutTooSmall;
+    w.writeAll(&hex) catch return error.OutTooSmall;
+    return w.buffered();
+}
+
 fn writeScopeTo(w: *Writer, scope: Scope) Writer.Error!void {
     try w.writeAll(&scope.date);
     try w.writeByte('/');
@@ -240,6 +352,200 @@ fn writeField(
     try w.writeAll(", Signature=");
     const hex: [64]u8 = std.fmt.bytesToHex(mac, .lower);
     try w.writeAll(&hex);
+}
+
+/// A query field the presigned form adds. The declaration order is the
+/// canonical name order, which is the order `canonical_fields` lists.
+const Field = enum { algorithm, credential, date, expires, security_token, signed_headers };
+
+/// The fields in canonical name order, which is the order the canonical query
+/// merges them in.
+const canonical_fields = [_]Field{ .algorithm, .credential, .date, .expires, .security_token, .signed_headers };
+
+/// The order the official suite emits, which is the order a presigned URL
+/// reads in: the algorithm, the credential, the date, the signed headers, the
+/// expiry, the token, and then the signature. The canonical query sorts
+/// instead.
+const emitted_fields = [_]Field{ .algorithm, .credential, .date, .signed_headers, .expires, .security_token };
+
+/// The values a presigned query adds, and the scope its credential names.
+const Fields = struct {
+    access_key: []const u8,
+    scope: Scope,
+    timestamp: []const u8,
+    expires_seconds: u32,
+    session_token: ?[]const u8,
+    /// The headers the signature covers, already sorted.
+    headers: []const canonical.Header,
+
+    /// False for the token when the credentials carry none.
+    fn present(self: Fields, field: Field) bool {
+        return field != .security_token or self.session_token != null;
+    }
+};
+
+fn fieldName(field: Field) []const u8 {
+    return switch (field) {
+        .algorithm => "X-Amz-Algorithm",
+        .credential => "X-Amz-Credential",
+        .date => "X-Amz-Date",
+        .expires => "X-Amz-Expires",
+        .security_token => session_token_query,
+        .signed_headers => "X-Amz-SignedHeaders",
+    };
+}
+
+/// The caller's own parameters, in the order it holds them, as the wire text
+/// they are.
+fn writeCallerQuery(w: *Writer, params: []const canonical.Param) Writer.Error!void {
+    for (params, 0..) |param, index| {
+        if (index != 0) try w.writeByte('&');
+        try w.writeAll(param.name);
+        try w.writeByte('=');
+        try w.writeAll(param.value);
+    }
+}
+
+/// The fields the signature adds. `separator` joins the first one to the
+/// caller's parameters; `&` joins the rest.
+fn writePresignedFields(w: *Writer, fields: Fields, separator: []const u8) Writer.Error!void {
+    var first = true;
+    for (emitted_fields) |field| {
+        if (!fields.present(field)) continue;
+        try w.writeAll(if (first) separator else "&");
+        first = false;
+        try writeQueryField(w, field, fields);
+    }
+}
+
+/// The same parameters in canonical order, without the signature.
+fn writeCanonicalQuery(w: *Writer, params: []const canonical.Param, fields: Fields) Writer.Error!void {
+    var it: Merge = .init(params, fields);
+    var first = true;
+    while (it.next()) |item| {
+        if (!first) try w.writeByte('&');
+        first = false;
+        switch (item) {
+            .param => |param| try canonical.writeQueryPair(w, param),
+            .field => |field| try writeQueryField(w, field, fields),
+        }
+    }
+}
+
+const Item = union(enum) {
+    param: canonical.Param,
+    field: Field,
+};
+
+/// Walks the caller's parameters, already in canonical order, and the fields
+/// in canonical name order, taking whichever name sorts first. A field name
+/// never equals a parameter name: `presign` refuses the reserved prefix.
+const Merge = struct {
+    params: []const canonical.Param,
+    fields: Fields,
+    param_index: usize = 0,
+    field_index: usize = 0,
+
+    fn init(params: []const canonical.Param, fields: Fields) Merge {
+        return .{ .params = params, .fields = fields };
+    }
+
+    fn next(self: *Merge) ?Item {
+        while (self.field_index < canonical_fields.len and
+            !self.fields.present(canonical_fields[self.field_index]))
+        {
+            self.field_index += 1;
+        }
+        if (self.param_index >= self.params.len) {
+            if (self.field_index >= canonical_fields.len) return null;
+            defer self.field_index += 1;
+            return .{ .field = canonical_fields[self.field_index] };
+        }
+        if (self.field_index >= canonical_fields.len) {
+            defer self.param_index += 1;
+            return .{ .param = self.params[self.param_index] };
+        }
+        const field = canonical_fields[self.field_index];
+        const order = encode.order(fieldName(field), self.params[self.param_index].name);
+        std.debug.assert(order != .eq);
+        if (order == .lt) {
+            defer self.field_index += 1;
+            return .{ .field = field };
+        }
+        defer self.param_index += 1;
+        return .{ .param = self.params[self.param_index] };
+    }
+};
+
+fn writeQueryField(w: *Writer, field: Field, fields: Fields) Writer.Error!void {
+    try w.writeAll(fieldName(field));
+    try w.writeByte('=');
+    switch (field) {
+        .algorithm => try w.writeAll(algorithm),
+        .credential => try writeCredential(w, fields),
+        .date => try w.writeAll(fields.timestamp),
+        .expires => try w.print("{d}", .{fields.expires_seconds}),
+        .security_token => try encode.writeQueryComponent(w, fields.session_token.?),
+        .signed_headers => try canonical.writeQueryNamesInto(w, fields.headers, null),
+    }
+}
+
+/// Writes the credential, `access_key/date/region/service/aws4_request`, with
+/// each `/` escaped as `%2F`. It is written in pieces, so no buffer has to
+/// hold a key whose length the library does not know.
+fn writeCredential(w: *Writer, fields: Fields) Writer.Error!void {
+    try encode.writeQueryComponent(w, fields.access_key);
+    try w.writeAll("%2F");
+    try encode.writeQueryComponent(w, &fields.scope.date);
+    try w.writeAll("%2F");
+    try encode.writeQueryComponent(w, fields.scope.region);
+    try w.writeAll("%2F");
+    try encode.writeQueryComponent(w, fields.scope.service);
+    try w.writeAll("%2F");
+    try w.writeAll(scope_terminator);
+}
+
+/// The canonical request, streamed into the hasher that signs it. `uri` is the
+/// escaped canonical URI, which the caller built in a buffer it can take back.
+fn writeCanonicalRequest(
+    w: *Writer,
+    request: canonical.Request,
+    uri: []const u8,
+    fields: Fields,
+) Writer.Error!void {
+    try canonical.writeMethodInto(w, request.method);
+    try w.writeByte('\n');
+    try w.writeAll(uri);
+    try w.writeByte('\n');
+    try writeCanonicalQuery(w, request.query, fields);
+    try w.writeByte('\n');
+    try canonical.writeHeadersInto(w, request.headers, null);
+    try w.writeByte('\n');
+    try canonical.writeNamesInto(w, request.headers, null);
+    try w.writeByte('\n');
+    try w.writeAll(request.payload_hash);
+}
+
+/// True when the name, once decoded, starts with the reserved prefix. An
+/// escaped `%58-Amz-Signature` is still reserved. The presigned form owns
+/// those names, and a second copy of one would leave the canonical query
+/// unsortable.
+fn isReserved(name: []const u8) bool {
+    var canonical_name: encode.Canonical = .init(name);
+    for (reserved_prefix) |byte| {
+        const decoded = canonical_name.next() orelse return false;
+        if (std.ascii.toLower(decoded) != byte) return false;
+    }
+    return true;
+}
+
+/// S3 answers a presigned URL only when the canonical URI is the wire path,
+/// the same rule the header form has. The content hash half of the header
+/// guard does not apply here: a presigned query carries no
+/// `x-amz-content-sha256`, and `UNSIGNED-PAYLOAD` is the caller's choice.
+fn checkPresignedS3(request: canonical.Request, credentials: Credentials) SignError!void {
+    if (!std.mem.startsWith(u8, credentials.service, "s3")) return;
+    if (request.path_mode != .s3) return error.PathModeMismatch;
 }
 
 /// HMAC keyed with `AWS4` + secret. A secret that does not fit one hash block
@@ -634,4 +940,222 @@ test "an s3express service takes the same guard" {
         .service = "s3express",
         .timestamp = "20260826T000000Z",
     }));
+}
+
+test "presign is the primitives in one row" {
+    const token = "AQoDYXdzEPT//////////wEXAMPLEtc764bNrC9SAPBSM22wDOk4x4HIZ8j4F";
+    const credentials: Credentials = .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "service",
+        .timestamp = "20260826T000000Z",
+        .session_token = token,
+    };
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var params = [_]canonical.Param{
+        .{ .name = "b", .value = "2" },
+        .{ .name = "a", .value = "1" },
+    };
+
+    var out: [1024]u8 = undefined;
+    const query = try presign(&out, .{
+        .method = "GET",
+        .path = "/",
+        .query = &params,
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    }, credentials, .{ .expires_seconds = 3600 });
+
+    // The same query, from the canonical request, the key chain, and the
+    // signature, with nothing of `presign`'s own in it.
+    var all = [_]canonical.Param{
+        .{ .name = "b", .value = "2" },
+        .{ .name = "a", .value = "1" },
+        .{ .name = "X-Amz-Algorithm", .value = algorithm },
+        .{ .name = "X-Amz-Credential", .value = "AKIDEXAMPLE/20260826/us-east-1/service/aws4_request" },
+        .{ .name = "X-Amz-Date", .value = credentials.timestamp },
+        .{ .name = "X-Amz-Expires", .value = "3600" },
+        .{ .name = "X-Amz-Security-Token", .value = token },
+        .{ .name = "X-Amz-SignedHeaders", .value = "host" },
+    };
+    var creq_buffer: [2048]u8 = undefined;
+    const creq = try canonical.writeRequest(&creq_buffer, .{
+        .method = "GET",
+        .path = "/",
+        .query = &all,
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    });
+    var digest: [32]u8 = undefined;
+    Sha256.hash(creq, &digest, .{});
+    const scope = try Scope.init(credentials.timestamp, credentials.region, credentials.service);
+    var string_buffer: [512]u8 = undefined;
+    const string_to_sign = try writeStringToSign(&string_buffer, credentials.timestamp, scope, digest);
+    const hex = std.fmt.bytesToHex(signature(signingKey(credentials.secret_key, scope), string_to_sign), .lower);
+
+    var expected: [1024]u8 = undefined;
+    var w: Writer = .fixed(&expected);
+    const emitted = [_]canonical.Param{
+        .{ .name = "b", .value = "2" },
+        .{ .name = "a", .value = "1" },
+        .{ .name = "X-Amz-Algorithm", .value = algorithm },
+        .{ .name = "X-Amz-Credential", .value = "AKIDEXAMPLE/20260826/us-east-1/service/aws4_request" },
+        .{ .name = "X-Amz-Date", .value = credentials.timestamp },
+        .{ .name = "X-Amz-SignedHeaders", .value = "host" },
+        .{ .name = "X-Amz-Expires", .value = "3600" },
+        .{ .name = "X-Amz-Security-Token", .value = token },
+        .{ .name = "X-Amz-Signature", .value = &hex },
+    };
+    for (emitted, 0..) |param, index| {
+        if (index != 0) try w.writeByte('&');
+        try canonical.writeQueryPair(&w, param);
+    }
+
+    // The caller's parameters keep their order, the canonical query sorts
+    // them, and the token is a query parameter and not a signed header.
+    try std.testing.expectEqualStrings(w.buffered(), query);
+}
+
+/// The credentials the presign tests share.
+const test_credentials: Credentials = .{
+    .access_key = "AKIDEXAMPLE",
+    .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+    .region = "us-east-1",
+    .service = "service",
+    .timestamp = "20260826T000000Z",
+};
+
+test "a presigned URL lives between one second and one week" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    const request: canonical.Request = .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    };
+    var out: [1024]u8 = undefined;
+
+    try std.testing.expectError(error.InvalidExpires, presign(&out, request, test_credentials, .{
+        .expires_seconds = 0,
+    }));
+    try std.testing.expectError(error.InvalidExpires, presign(&out, request, test_credentials, .{
+        .expires_seconds = max_expires_seconds + 1,
+    }));
+    const shortest = try presign(&out, request, test_credentials, .{ .expires_seconds = 1 });
+    try std.testing.expect(std.mem.find(u8, shortest, "X-Amz-Expires=1&") != null);
+    _ = try presign(&out, request, test_credentials, .{ .expires_seconds = max_expires_seconds });
+}
+
+test "a presigned query needs a host and room for the path" {
+    var headers = [_]canonical.Header{
+        .{ .name = "x-amz-date", .value = "20260826T000000Z" },
+    };
+    var out: [256]u8 = undefined;
+    const unsigned: canonical.Request = .{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    };
+    try std.testing.expectError(error.MissingHost, presign(&out, unsigned, test_credentials, .{
+        .expires_seconds = 3600,
+    }));
+
+    // The escaped path is written into `out` while the signature is computed.
+    var host = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectError(error.OutTooSmall, presign(&tiny, .{
+        .method = "GET",
+        .path = "/a/longer/path/than/the/buffer",
+        .headers = &host,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    }, test_credentials, .{ .expires_seconds = 3600 }));
+}
+
+test "a caller parameter cannot take a reserved name" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var out: [1024]u8 = undefined;
+
+    var reserved = [_]canonical.Param{
+        .{ .name = "X-Amz-Signature", .value = "0" },
+    };
+    try std.testing.expectError(error.ReservedQueryParameter, presign(&out, .{
+        .method = "GET",
+        .path = "/",
+        .query = &reserved,
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    }, test_credentials, .{ .expires_seconds = 3600 }));
+
+    // An escaped `X` is the same name, and the prefix is not case-sensitive.
+    var escaped = [_]canonical.Param{
+        .{ .name = "%58-amz-date", .value = "x" },
+    };
+    try std.testing.expectError(error.ReservedQueryParameter, presign(&out, .{
+        .method = "GET",
+        .path = "/",
+        .query = &escaped,
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    }, test_credentials, .{ .expires_seconds = 3600 }));
+}
+
+test "a presigned S3 URL uses the S3 path mode and the caller's payload hash" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+    };
+    var out: [1024]u8 = undefined;
+    var request: canonical.Request = .{
+        .method = "GET",
+        .path = "/a%20b",
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    };
+    const s3: Credentials = .{
+        .access_key = test_credentials.access_key,
+        .secret_key = test_credentials.secret_key,
+        .region = test_credentials.region,
+        .service = "s3",
+        .timestamp = test_credentials.timestamp,
+    };
+
+    try std.testing.expectError(error.PathModeMismatch, presign(&out, request, s3, .{
+        .expires_seconds = 3600,
+    }));
+
+    // `UNSIGNED-PAYLOAD` is the caller's choice, not a check: a hashed payload
+    // signs here, and the query form carries no `x-amz-content-sha256`.
+    request.path_mode = .s3;
+    _ = try presign(&out, request, s3, .{ .expires_seconds = 3600 });
+    request.payload_hash = canonical.empty_payload_hash;
+    const query = try presign(&out, request, s3, .{ .expires_seconds = 3600 });
+    try std.testing.expect(std.mem.find(u8, query, "x-amz-content-sha256") == null);
+}
+
+test "a header in the slice is signed in the query form" {
+    var headers = [_]canonical.Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    var out: [1024]u8 = undefined;
+    const query = try presign(&out, .{
+        .method = "PUT",
+        .path = "/",
+        .headers = &headers,
+        .payload_hash = "UNSIGNED-PAYLOAD",
+    }, test_credentials, .{ .expires_seconds = 3600 });
+
+    // The recipient has to send the header back, so it is both signed and
+    // named, and a token the credentials do not carry is not written.
+    try std.testing.expect(std.mem.find(u8, query, "X-Amz-SignedHeaders=content-type%3Bhost&") != null);
+    try std.testing.expect(std.mem.find(u8, query, "X-Amz-Security-Token") == null);
 }
