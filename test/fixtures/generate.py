@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the reference vectors the official suite does not cover.
 
-The official suite (tests/aws-signing-test-suite) has no case for a header the
+The official suite (test/fixtures/aws-signing-suite) has no case for a header the
 signer sees but must not sign, duplicate header lines, an empty query
 parameter, a path that needs a second escape, or a session token handed to the
 signer out of band. This script signs one of each with botocore, the signer AWS
@@ -12,10 +12,10 @@ Run it from the repository root, with botocore on the interpreter:
 
     nix shell --impure --expr \
       'with import (builtins.getFlake "nixpkgs") {}; python3.withPackages (ps: [ ps.botocore ])' \
-      -c python3 tests/vectors/generate.py
+      -c python3 test/fixtures/generate.py
 
 The vectors are checked in. Regenerate them only when the shapes change, and
-record the botocore version in tests/vectors/README.md when they do.
+record the botocore version in test/fixtures/README.md when they do.
 """
 
 import json
@@ -33,7 +33,7 @@ TIMESTAMP = "20150830T123600Z"
 HOST = "example.amazonaws.com"
 TOKEN = "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"
 
-OUT_ROOT = os.path.join(os.path.dirname(__file__), "v4")
+OUT_ROOT = os.path.join(os.path.dirname(__file__), "vectors", "v4")
 
 
 def sign(case, method, path, params, headers, region="us-east-1", service="service", token=None):

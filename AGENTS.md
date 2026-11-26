@@ -23,11 +23,12 @@ A repo that must also build on the previous release follows the dual-version pat
 
 ## Verification
 
-`just test` runs the AWS signing test suite in `tests/aws-signing-test-suite/`
-and the botocore vectors in `tests/vectors/`. Both roots are indexed at run
+`just test` runs the AWS signing test suite in
+`test/fixtures/aws-signing-suite/` and the botocore vectors in
+`test/fixtures/vectors/`. Both roots are indexed at run
 time, with the working directory at the build root, so a new case is a
 directory with the suite's file layout and no runner change. Do not edit a
-vendored fixture. Add a vector with `tests/vectors/generate.py` and record the
+vendored fixture. Add a vector with `test/fixtures/generate.py` and record the
 signer's version.
 
 ## Changelog

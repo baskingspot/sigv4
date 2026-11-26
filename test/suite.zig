@@ -21,8 +21,8 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-const suite_root = "tests/aws-signing-test-suite/v4";
-const vector_root = "tests/vectors/v4";
+const suite_root = "test/fixtures/aws-signing-suite/v4";
+const vector_root = "test/fixtures/vectors/v4";
 
 const max_file = 1 << 20;
 
