@@ -14,9 +14,22 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
 
-    const test_step = b.step("test", "Run the unit tests, the AWS suite, and the guide's examples");
+    // testingx provides the test runner. It is lazy because only the root
+    // build uses it; a consumer never fetches it. On the first configure pass
+    // it is not fetched yet, `dependencyLazy` returns null, and the build
+    // runner fetches it and reruns this script.
+    const testingx_dep = (b.dependencyLazy("testingx", .{ .target = target }) catch null);
+    const test_runner: ?std.Build.Step.Compile.TestRunner = if (testingx_dep) |dep|
+        .{ .path = dep.path("src/runner.zig"), .mode = .simple }
+    else
+        null;
 
-    const mod_tests = b.addTest(.{ .root_module = mod });
+    const test_step = b.step("test", "Run the unit tests, the AWS suite, and the README example");
+
+    const mod_tests = b.addTest(.{
+        .root_module = mod,
+        .test_runner = test_runner,
+    });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     run_mod_tests.addPassthruArgs();
     test_step.dependOn(&run_mod_tests.step);
@@ -29,7 +42,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "sigv4", .module = mod }},
     });
-    const suite_tests = b.addTest(.{ .root_module = suite_mod });
+    const suite_tests = b.addTest(.{
+        .root_module = suite_mod,
+        .test_runner = test_runner,
+    });
     const run_suite_tests = b.addRunArtifact(suite_tests);
     run_suite_tests.setCwd(b.path("."));
     // The run reads every fixture under its roots, which the build graph
@@ -46,7 +62,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "sigv4", .module = mod }},
     });
-    const example_tests = b.addTest(.{ .root_module = examples_mod });
+    const example_tests = b.addTest(.{
+        .root_module = examples_mod,
+        .test_runner = test_runner,
+    });
     const run_example_tests = b.addRunArtifact(example_tests);
     test_step.dependOn(&run_example_tests.step);
 }
