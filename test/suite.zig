@@ -10,6 +10,11 @@
 //! the signer as a credential, never as a header line, so the injection path
 //! is what the suite checks.
 //!
+//! The query form also runs through `signing.presign`, which assembles the
+//! whole query. The suite emits it in the order `presign` writes; botocore,
+//! which wrote the reference vectors, emits `X-Amz-Expires` before
+//! `X-Amz-SignedHeaders`, so a vector is compared as parameters.
+//!
 //! The files are read at run time with the working directory at the build
 //! root, so a fixture added to a root runs without touching this file.
 
@@ -28,49 +33,75 @@ const vector_root = "test/fixtures/vectors/v4";
 
 const max_file = 1 << 20;
 
+/// The suite's presigner writes the order `presign` writes. A vector comes
+/// from botocore, which orders the parameters its own way.
+const Root = enum { suite, vector };
+
+/// The suite case whose URL carries an `X-Amz-Security-Token` that its own
+/// signature does not cover: the token header arrives after signing.
+/// `presign` signs the token it is given or writes none, so it cannot write
+/// that query.
+const unsigned_token_case = "post-sts-header-after";
+
+const Counter = struct {
+    header: u32 = 0,
+    query: u32 = 0,
+    presign: u32 = 0,
+    skipped: u32 = 0,
+};
+
 test "the AWS suite and the reference vectors" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var suite_variants: u32 = 0;
-    const suite_cases = try runRoot(testing.io, arena, suite_root, &suite_variants);
-    var vector_variants: u32 = 0;
-    const vector_cases = try runRoot(testing.io, arena, vector_root, &vector_variants);
+    var suite: Counter = .{};
+    const suite_cases = try runRoot(testing.io, arena, suite_root, .suite, &suite);
+    var vector: Counter = .{};
+    const vector_cases = try runRoot(testing.io, arena, vector_root, .vector, &vector);
 
-    // Every suite case signs a header request and a presigned one; every
-    // reference vector has the header form only. A case with neither is a
-    // case the runner skipped, which is how a renamed file would hide.
-    try testing.expectEqual(suite_cases * 2, suite_variants);
-    try testing.expectEqual(vector_cases, vector_variants);
+    // Every suite case signs a header request and a presigned one, and every
+    // presigned query is assembled by `presign` except the one whose fixture
+    // writes a parameter the signature does not cover.
+    try testing.expectEqual(suite_cases, suite.header);
+    try testing.expectEqual(suite_cases, suite.query);
+    try testing.expectEqual(1, suite.skipped);
+    try testing.expectEqual(suite.query, suite.presign + suite.skipped);
+
+    // A vector records the forms it needs, so the count is a floor: a case
+    // with no usable variant is how a renamed file would hide. Every query
+    // variant is a presigned URL.
+    try testing.expect(vector.header + vector.query >= vector_cases);
+    try testing.expectEqual(vector.query, vector.presign);
+    try testing.expect(vector.query > 0);
 }
 
-fn runRoot(io: Io, arena: Allocator, root_path: []const u8, variants: *u32) !u32 {
-    var root = try Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
-    defer root.close(io);
+fn runRoot(io: Io, arena: Allocator, root_path: []const u8, root: Root, counter: *Counter) !u32 {
+    var dir = try Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer dir.close(io);
 
     var cases: u32 = 0;
-    var entries = root.iterate();
+    var entries = dir.iterate();
     while (try entries.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        var dir = try root.openDir(io, entry.name, .{});
-        defer dir.close(io);
-        try runCase(io, arena, dir, entry.name, variants);
+        var case_dir = try dir.openDir(io, entry.name, .{});
+        defer case_dir.close(io);
+        try runCase(io, arena, case_dir, entry.name, root, counter);
         cases += 1;
     }
     try testing.expect(cases > 0);
     return cases;
 }
 
-fn runCase(io: Io, arena: Allocator, dir: Io.Dir, name: []const u8, variants: *u32) !void {
+fn runCase(io: Io, arena: Allocator, dir: Io.Dir, name: []const u8, root: Root, counter: *Counter) !void {
     errdefer std.debug.print("fixture {s} failed\n", .{name});
 
     const wire = try parseRequest(arena, try readIn(io, dir, arena, "request.txt"));
     const context = try parseContext(arena, try readIn(io, dir, arena, "context.json"));
-    const payload_hash = try payloadHash(arena, wire.body, context.sign_body);
+    const payload_hash = context.payload_hash orelse try payloadHash(arena, wire.body, context.sign_body);
 
-    if (try runVariant(io, arena, dir, .header, wire, context, payload_hash)) variants.* += 1;
-    if (try runVariant(io, arena, dir, .query, wire, context, payload_hash)) variants.* += 1;
+    if (try runVariant(io, arena, dir, .header, name, root, counter, wire, context, payload_hash)) counter.header += 1;
+    if (try runVariant(io, arena, dir, .query, name, root, counter, wire, context, payload_hash)) counter.query += 1;
 }
 
 const Kind = enum { header, query };
@@ -80,6 +111,9 @@ fn runVariant(
     arena: Allocator,
     dir: Io.Dir,
     kind: Kind,
+    name: []const u8,
+    root: Root,
+    counter: *Counter,
     wire: Wire,
     context: Context,
     payload_hash: []const u8,
@@ -146,21 +180,66 @@ fn runVariant(
     const mac = sigv4.signing.signature(key, string_to_sign);
     try testing.expectEqualStrings(expected_signature, &std.fmt.bytesToHex(mac, .lower));
 
+    const credentials: sigv4.signing.Credentials = .{
+        .access_key = context.access_key,
+        .secret_key = context.secret_key,
+        .region = context.region,
+        .service = context.service,
+        .timestamp = context.timestamp,
+        .session_token = context.session_token,
+    };
+
     if (kind == .header) {
-        const credentials: sigv4.signing.Credentials = .{
-            .access_key = context.access_key,
-            .secret_key = context.secret_key,
-            .region = context.region,
-            .service = context.service,
-            .timestamp = context.timestamp,
-            .session_token = context.session_token,
-        };
         var field_buffer: [2048]u8 = undefined;
         const field = try sigv4.signing.writeAuthorization(&field_buffer, &creq_buffer, request, credentials);
         const expected_field = headerValue(signed.headers, "authorization") orelse return error.NoAuthorization;
         try testing.expectEqualStrings(expected_field, field);
+    } else if (context.session_token == null and hasParam(signed.query, "X-Amz-Security-Token")) {
+        try testing.expectEqual(Root.suite, root);
+        try testing.expect(std.mem.eql(u8, name, unsigned_token_case));
+        counter.skipped += 1;
+    } else {
+        // The query, built from the wire request: the caller's parameters as
+        // they arrived, plus the fields the presigned form adds.
+        var query_buffer: [16 * 1024]u8 = undefined;
+        const presigned = try sigv4.signing.presign(&query_buffer, .{
+            .method = wire.method,
+            .path = wire.path,
+            .query = try parseQuery(arena, wire.query),
+            .headers = try selectHeaders(arena, wire.headers, signed.headers, names),
+            .payload_hash = payload_hash,
+            .path_mode = context.path_mode,
+        }, credentials, .{ .expires_seconds = context.expires_seconds });
+        switch (root) {
+            .suite => try testing.expectEqualStrings(signed.query, presigned),
+            .vector => try expectSameParams(arena, signed.query, presigned),
+        }
+        counter.presign += 1;
     }
     return true;
+}
+
+fn hasParam(query: []const u8, name: []const u8) bool {
+    var pairs = std.mem.splitScalar(u8, query, '&');
+    while (pairs.next()) |pair| {
+        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        if (std.mem.eql(u8, pair[0..equals], name)) return true;
+    }
+    return false;
+}
+
+/// The parameters of the two queries, in any order. botocore emits
+/// `X-Amz-Expires` before `X-Amz-SignedHeaders`; the suite emits the reverse.
+fn expectSameParams(arena: Allocator, expected: []const u8, actual: []const u8) !void {
+    const want = try parseQuery(arena, expected);
+    const got = try parseQuery(arena, actual);
+    sigv4.canonical.sortQuery(want);
+    sigv4.canonical.sortQuery(got);
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |left, right| {
+        try testing.expectEqualStrings(left.name, right.name);
+        try testing.expectEqualStrings(left.value, right.value);
+    }
 }
 
 /// The session token never arrives as a header line in these fixtures; it is a
@@ -282,6 +361,10 @@ const Context = struct {
     session_token: ?[]const u8,
     path_mode: sigv4.canonical.PathMode,
     sign_body: bool,
+    expires_seconds: u32,
+    /// A vector can pin the payload hash instead of describing a body, which
+    /// is how a presigned S3 request says `UNSIGNED-PAYLOAD`.
+    payload_hash: ?[]const u8,
 };
 
 fn parseContext(arena: Allocator, text: []const u8) !Context {
@@ -315,6 +398,9 @@ fn parseContext(arena: Allocator, text: []const u8) !Context {
         .session_token = session_token,
         .path_mode = path_mode,
         .sign_body = (root.get("sign_body") orelse return error.MalformedContext).bool,
+        .expires_seconds = @intCast((root.get("expiration_in_seconds") orelse
+            return error.MalformedContext).integer),
+        .payload_hash = if (root.get("payload_hash")) |value| value.string else null,
     };
 }
 

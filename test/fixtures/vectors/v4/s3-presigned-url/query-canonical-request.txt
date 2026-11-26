@@ -1,0 +1,7 @@
+GET
+/a%20b%2Bc%25d%3De
+X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=3600&X-Amz-Security-Token=6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267&X-Amz-SignedHeaders=host
+host:example.amazonaws.com
+
+host
+UNSIGNED-PAYLOAD
