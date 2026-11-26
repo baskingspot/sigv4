@@ -6,7 +6,7 @@
 </h1>
 
 AWS Signature Version 4 request signing in Zig: the canonical request, the
-string to sign, and the HMAC-SHA256 signing key.
+string to sign, and the HMAC-SHA256 signing key, with no I/O.
 
 Every request to an AWS API carries a signature over its method, path, headers,
 and body hash. The algorithm is fixed and small. The failures are in the
